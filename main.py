@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 
@@ -66,64 +67,21 @@ def is_owner(message: Message) -> bool:
     return bool(message.from_user and message.from_user.id == OWNER_ID)
 
 
+def clean_relay_request(text: str) -> str:
+    """Remove the Dibakar name and every @username mention before relaying."""
+    text = re.sub(r"(?i)\bDibakar\b", "", text)
+    text = re.sub(r"(?<!\w)@[A-Za-z0-9_]+", "", text)
+    # Trim excess horizontal whitespace without flattening intentional newlines.
+    lines = [re.sub(r"[ \t]{2,}", " ", line).strip() for line in text.splitlines()]
+    return "\n".join(line for line in lines if line).strip()
+
+
 def encrypt_session(session_string: str) -> str:
     return fernet.encrypt(session_string.encode()).decode()
 
 
 def decrypt_session(encrypted: str) -> str:
     return fernet.decrypt(encrypted.encode()).decode()
-
-
-# Redact personal identifiers before relaying Bot 1 output to end users.
-_SENSITIVE_FIELDS = {
-    "name", "first_name", "middle_name", "last_name", "father_name",
-    "aadhar", "aadhaar", "mobile", "phone", "alternate_mobile",
-    "email", "address", "date_of_birth", "dob",
-}
-
-
-def _redact_json(value):
-    if isinstance(value, dict):
-        cleaned = {}
-        for key, item in value.items():
-            if str(key).casefold() in _SENSITIVE_FIELDS and item not in (None, ""):
-                cleaned[key] = "[REDACTED]"
-            else:
-                cleaned[key] = _redact_json(item)
-        return cleaned
-    if isinstance(value, list):
-        return [_redact_json(item) for item in value]
-    return value
-
-
-def prepare_user_response(text: str) -> str:
-    """Tidy Bot 1 output and redact sensitive personal-data fields.
-
-    Keeps source/credit lines and other attribution intact.
-    """
-    cleaned = "\n".join(line.rstrip() for line in (text or "").splitlines()).strip()
-    while "\n\n\n" in cleaned:
-        cleaned = cleaned.replace("\n\n\n", "\n\n")
-
-    # Redact a phone-like value in a Query header.
-    import re
-    cleaned = re.sub(
-        r"(?im)^(\s*Query\s*:\s*)[+()\d .-]{7,}$",
-        r"\1[REDACTED]",
-        cleaned,
-    )
-
-    # Pretty-print JSON objects embedded in Bot 1's message.
-    start = cleaned.find("{")
-    if start >= 0:
-        try:
-            parsed, end = json.JSONDecoder().raw_decode(cleaned[start:])
-            parsed = _redact_json(parsed)
-            pretty = json.dumps(parsed, ensure_ascii=False, indent=2)
-            cleaned = cleaned[:start] + pretty + cleaned[start + end:]
-        except (json.JSONDecodeError, TypeError, ValueError):
-            pass
-    return cleaned
 
 
 async def init_db():
@@ -238,69 +196,67 @@ async def connect_user_client(session_string: str | None = None):
                 response_text = event.raw_text or ""
                 if not response_text.strip():
                     return
-                user_response_text = prepare_user_response(response_text)
-                if not user_response_text:
-                    return
 
                 replied_to = event.message.reply_to_msg_id
                 pending_row = None
 
-                # Bot 1 can answer immediately after Telethon sends the request.
-                # The send_message() coroutine may return before the request mapping
-                # has been committed to PostgreSQL, so briefly retry the lookup.
-                for lookup_attempt in range(10):
-                    async with db.acquire() as conn:
-                        if replied_to:
-                            # Match the original request or any earlier Bot 1 response
-                            # belonging to the same request (multi-part replies).
+                async with db.acquire() as conn:
+                    if replied_to:
+                        # Match a reply to the original request, or to any earlier
+                        # Bot 1 response belonging to that request (multi-part replies).
+                        pending_row = await conn.fetchrow(
+                            "SELECT p.group_message_id, p.user_id FROM relay_pending p "
+                            "WHERE p.group_message_id = $1",
+                            replied_to,
+                        )
+                        if pending_row is None:
                             pending_row = await conn.fetchrow(
-                                "SELECT p.group_message_id, p.user_id FROM relay_pending p "
-                                "WHERE p.group_message_id = $1",
+                                "SELECT p.group_message_id, p.user_id "
+                                "FROM relay_response_messages r "
+                                "JOIN relay_pending p ON p.group_message_id = r.group_message_id "
+                                "WHERE r.response_message_id = $1",
                                 replied_to,
                             )
-                            if pending_row is None:
-                                pending_row = await conn.fetchrow(
-                                    "SELECT p.group_message_id, p.user_id "
-                                    "FROM relay_response_messages r "
-                                    "JOIN relay_pending p ON p.group_message_id = r.group_message_id "
-                                    "WHERE r.response_message_id = $1",
-                                    replied_to,
-                                )
 
-                        if pending_row is None:
-                            # Correlate standalone responses with a unique Query line.
-                            query_value = None
-                            for line in response_text.splitlines():
-                                label, separator, value = line.partition(":")
-                                if separator and label.strip().casefold() == "query":
-                                    query_value = value.strip().strip("` ")
-                                    break
-                            if query_value:
-                                rows = await conn.fetch(
-                                    "SELECT group_message_id, user_id, request_text "
-                                    "FROM relay_pending ORDER BY created_at ASC"
-                                )
-                                matches = []
-                                for candidate in rows:
-                                    request = (candidate["request_text"] or "").strip()
-                                    argument = request.split(maxsplit=1)[1].strip() if " " in request else request
-                                    if argument.casefold() == query_value.casefold():
-                                        matches.append(candidate)
-                                if len(matches) == 1:
-                                    pending_row = matches[0]
+                    if pending_row is None:
+                        # Some processing bots post their result as a new group message.
+                        # First try to correlate its `Query: ...` line with the argument
+                        # supplied to the original command (e.g. /Info 12345).
+                        query_value = None
+                        for line in response_text.splitlines():
+                            label, separator, value = line.partition(":")
+                            if separator and label.strip().casefold() == "query":
+                                query_value = value.strip().strip("` ")
+                                break
 
-                        if pending_row is None and not replied_to:
+                        if query_value:
                             rows = await conn.fetch(
-                                "SELECT group_message_id, user_id FROM relay_pending "
-                                "ORDER BY created_at ASC LIMIT 2"
+                                "SELECT group_message_id, user_id, request_text "
+                                "FROM relay_pending ORDER BY created_at ASC"
                             )
-                            if len(rows) == 1:
-                                pending_row = rows[0]
+                            matches = []
+                            for candidate in rows:
+                                request = (candidate["request_text"] or "").strip()
+                                argument = request.split(maxsplit=1)[1].strip() if " " in request else request
+                                if argument.casefold() == query_value.casefold():
+                                    matches.append(candidate)
+                            if len(matches) == 1:
+                                pending_row = matches[0]
 
-                    if pending_row is not None:
-                        break
-                    if lookup_attempt < 9:
-                        await asyncio.sleep(0.2)
+                    if pending_row is None and not replied_to:
+                        # Safe fallback for ordinary text requests: only route when
+                        # exactly one request is pending, never guess between users.
+                        rows = await conn.fetch(
+                            "SELECT group_message_id, user_id FROM relay_pending "
+                            "ORDER BY created_at ASC LIMIT 2"
+                        )
+                        if len(rows) == 1:
+                            pending_row = rows[0]
+                        elif len(rows) > 1:
+                            log.warning(
+                                "Bot 1 sent a non-reply message while multiple requests were pending; "
+                                "cannot safely identify the recipient."
+                            )
 
                 if pending_row is None:
                     log.info(
@@ -314,7 +270,7 @@ async def connect_user_client(session_string: str | None = None):
                 try:
                     await bot.send_message(
                         chat_id=user_id,
-                        text=user_response_text,
+                        text=response_text,
                         parse_mode=None,
                         disable_web_page_preview=True,
                     )
@@ -339,21 +295,11 @@ async def connect_user_client(session_string: str | None = None):
                         event.message.id,
                         pending_row["group_message_id"],
                     )
-                # Keep the request mapping alive for REQUEST_TIMEOUT_SECONDS after
-                # the most recent response, allowing delayed follow-up messages.
-                request_id = pending_row["group_message_id"]
-                old_timeout = pending_timeout_tasks.get(request_id)
-                if old_timeout and not old_timeout.done():
-                    old_timeout.cancel()
-                pending_timeout_tasks[request_id] = asyncio.create_task(
-                    timeout_request(request_id, user_id)
-                )
-
                 log.info(
                     "Delivered Bot 1 message %s to user %s for request %s",
                     event.message.id,
                     user_id,
-                    request_id,
+                    pending_row["group_message_id"],
                 )
             except Exception:
                 log.exception("Error processing a group response.")
@@ -648,7 +594,6 @@ async def handle_user_text(message: Message):
     # are treated as ordinary relay requests and forwarded unchanged to Bot 1.
     remaining = await check_and_set_cooldown(message.from_user.id)
     if remaining:
-        # Cooldown notices are private Bot 2 replies only; do not send them to GROUP_ID.
         await message.answer(f"⏳ Please wait {remaining} seconds before sending another message.")
         return
 
@@ -656,8 +601,13 @@ async def handle_user_text(message: Message):
     if client is None or not client.is_connected():
         await message.answer("⚠️ The service is temporarily unavailable. Please try again later.")
         return
+    cleaned_text = clean_relay_request(message.text)
+    if not cleaned_text:
+        await message.answer("Please send a request after removing the name and @username mentions.")
+        return
+
     try:
-        sent = await client.send_message(GROUP_ID, message.text)
+        sent = await client.send_message(GROUP_ID, cleaned_text)
         async with db.acquire() as conn:
             await conn.execute("""
                 INSERT INTO relay_pending(group_message_id, user_id, request_text)
@@ -666,7 +616,7 @@ async def handle_user_text(message: Message):
                 SET user_id = EXCLUDED.user_id,
                     request_text = EXCLUDED.request_text,
                     created_at = NOW()
-            """, sent.id, message.from_user.id, message.text)
+            """, sent.id, message.from_user.id, cleaned_text)
         task = asyncio.create_task(timeout_request(sent.id, message.from_user.id))
         pending_timeout_tasks[sent.id] = task
         await message.answer("✅ Your request has been sent to the processing group.")
