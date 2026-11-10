@@ -31,6 +31,7 @@ BOT1_ID = os.getenv("BOT1_ID", "").strip()
 TELETHON_API_ID = os.getenv("TELETHON_API_ID", "").strip()
 TELETHON_API_HASH = os.getenv("TELETHON_API_HASH", "").strip()
 TELETHON_PHONE = os.getenv("TELETHON_PHONE", "").strip()
+TELETHON_SESSION = os.getenv("TELETHON_SESSION", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 RESPONSE_TIMEOUT_SECONDS = float(os.getenv("RESPONSE_TIMEOUT_SECONDS", "3600"))
 RESPONSE_SETTLE_SECONDS = float(os.getenv("RESPONSE_SETTLE_SECONDS", "1.0"))
@@ -281,12 +282,23 @@ async def main():
     if missing:
         raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
     await db_init()
+    # Prefer the PostgreSQL session; use TELETHON_SESSION for the first deployment
+    # or recovery when the database has no authorized session yet.
     saved = await load_session()
+    if not saved:
+        saved = TELETHON_SESSION
     await connect_telethon(saved)
     if await telethon_client.is_user_authorized():
         log.info("Telethon session loaded and authorized")
+        if not await load_session():
+            await save_session(TELETHON_PHONE or "configured-session")
+            log.info("Initial Telethon session saved to PostgreSQL")
     else:
-        raise RuntimeError("Telethon session is not authorized. An authorized Telethon session must already exist in PostgreSQL.")
+        raise RuntimeError(
+            "Telethon session is missing or unauthorized. Generate a session with "
+            "auth_session.py, add its output as the Render environment variable "
+            "TELETHON_SESSION, then redeploy. Do not share this session string."
+        )
     bot_app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     bot_app.add_handler(MessageHandler(filters.ALL, handle_incoming))
     log.info("GAMERZONE Python bot starting")

@@ -20,12 +20,13 @@ Keep these existing variable names in Railway:
 - `BOT1_ID` — Bot 1 numeric Telegram user ID; used to accept replies only from Bot 1
 - `TELETHON_API_ID`
 - `TELETHON_API_HASH`
-- `TELETHON_PHONE` — retained for compatibility
+- `TELETHON_PHONE` — phone number used only by the local session generator
+- `TELETHON_SESSION` — initial Telethon StringSession; after first successful boot it is saved to PostgreSQL
 - `DATABASE_URL` — PostgreSQL connection URL
 - `RESPONSE_SETTLE_SECONDS` — optional, default `1.0`
 - `RESPONSE_TIMEOUT_SECONDS` — retained for compatibility; no timeout message is sent
 
-The Telethon user session must already be authorized and stored in the PostgreSQL `gz_telegram_session` table. The public bot has no `/login`, `/help`, `/start`, or lookup command handlers; every incoming private-chat message is treated as a user message and relayed.
+The Telethon user session must be authorized so the relay can observe Bot 1's group replies. To create it without adding login commands to Bot 2, run `python auth_session.py` on your computer, enter the phone number, Telegram login code and (if enabled) 2FA password, then copy the printed session string into Render as `TELETHON_SESSION`. On first successful startup, the app stores it in PostgreSQL (`gz_telegram_session`). Keep the session string secret. The public bot has no `/login`, `/help`, `/start`, or lookup command handlers; every incoming private-chat message is treated as a user message and relayed.
 
 ## Railway deployment
 
