@@ -192,8 +192,13 @@ async def connect_user_client(session_string: str | None = None):
             await client.disconnect()
             return None
 
+        # Some processing bots send later result parts as new messages rather
+        # than Telegram replies. Remember the last confidently matched request.
+        last_bot1_route: tuple[int, float] | None = None
+
         @client.on(events.NewMessage(chats=GROUP_ID))
         async def on_group_message(event):
+            nonlocal last_bot1_route
             try:
                 # Only accept messages authored by the configured Bot 1.
                 if event.sender_id != BOT1_ID:
@@ -250,6 +255,18 @@ async def connect_user_client(session_string: str | None = None):
                             if len(matches) == 1:
                                 pending_row = matches[0]
 
+                    if pending_row is None and not replied_to and last_bot1_route:
+                        # Bot 1 may publish part 2/3 as a fresh group message with
+                        # no reply_to and no Query line. Continue the last matched
+                        # request while its normal request window is still active.
+                        last_group_id, last_seen = last_bot1_route
+                        if time.monotonic() - last_seen <= REQUEST_TIMEOUT_SECONDS:
+                            pending_row = await conn.fetchrow(
+                                "SELECT group_message_id, user_id FROM relay_pending "
+                                "WHERE group_message_id = $1",
+                                last_group_id,
+                            )
+
                     if pending_row is None and not replied_to:
                         # Safe fallback for ordinary text requests: only route when
                         # exactly one request is pending, never guess between users.
@@ -274,6 +291,7 @@ async def connect_user_client(session_string: str | None = None):
                     return
 
                 user_id = pending_row["user_id"]
+                last_bot1_route = (pending_row["group_message_id"], time.monotonic())
                 try:
                     await bot.send_message(
                         chat_id=user_id,
