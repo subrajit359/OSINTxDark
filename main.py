@@ -11,7 +11,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from cryptography.fernet import Fernet, InvalidToken
 from telethon import TelegramClient, events
 from telethon.errors import (
@@ -121,6 +121,13 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS relay_cooldowns (
                 user_id BIGINT PRIMARY KEY,
                 accepted_at TIMESTAMPTZ NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS force_sub_channels (
+                channel_id BIGINT PRIMARY KEY,
+                title TEXT NOT NULL,
+                username TEXT,
+                invite_link TEXT NOT NULL,
+                added_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
         """)
 
@@ -386,10 +393,212 @@ async def check_and_set_cooldown(user_id: int) -> int:
 
 # --------------------------------- Admin ----------------------------------
 
+async def get_unjoined_channels(user_id: int):
+    """Return (channels_not_joined, verification_error)."""
+    async with db.acquire() as conn:
+        channels = await conn.fetch(
+            "SELECT channel_id, title, username, invite_link FROM force_sub_channels ORDER BY added_at"
+        )
+
+    missing = []
+    for channel in channels:
+        try:
+            member = await bot.get_chat_member(channel["channel_id"], user_id)
+            joined = member.status in ("creator", "administrator", "member")
+            if member.status == "restricted":
+                joined = bool(getattr(member, "is_member", False))
+            if not joined:
+                missing.append(channel)
+        except Exception:
+            log.exception("Could not verify membership in force-subscription channel %s", channel["channel_id"])
+            return [], True
+    return missing, False
+
+
+async def send_force_sub_prompt(message: Message, user_id: int) -> bool:
+    """Block non-members and show channel join links. Return True if blocked."""
+    if user_id == OWNER_ID:
+        return False
+    missing, verification_error = await get_unjoined_channels(user_id)
+    if verification_error:
+        await message.answer(
+            "⚠️ I couldn't verify channel membership right now. Please try again in a moment."
+        )
+        return True
+    if not missing:
+        return False
+
+    rows = [
+        [InlineKeyboardButton(text=f"📢 Join {channel['title']}", url=channel["invite_link"])]
+        for channel in missing
+    ]
+    rows.append([InlineKeyboardButton(text="✅ Verify Membership", callback_data="force_sub_check")])
+    await message.answer(
+        "🔒 Join all required channels using the buttons below.\n"
+        "After joining every channel, tap **Verify Membership**.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        parse_mode="Markdown",
+    )
+    return True
+
+
+@dp.callback_query(F.data == "force_sub_check")
+async def force_sub_check_callback(callback: CallbackQuery):
+    if callback.from_user.id == OWNER_ID:
+        await callback.answer("Owner access is enabled.", show_alert=True)
+        return
+    missing, verification_error = await get_unjoined_channels(callback.from_user.id)
+    if verification_error:
+        await callback.answer("Membership check failed. Please try again.", show_alert=True)
+        return
+    if missing:
+        await callback.answer("You still need to join all required channels.", show_alert=True)
+        return
+    await callback.answer("Subscription verified!")
+    if callback.message:
+        await callback.message.edit_text(
+            "✅ Subscription verified. You can now use the bot. Send /start to continue."
+        )
+
+
+@dp.message(Command("addchannel"))
+async def add_force_sub_channel(message: Message):
+    if not is_owner(message):
+        await message.answer("⛔ Unauthorized access.")
+        return
+    # Preferred format: /addchannel <channel_id> <invite_link>
+    # Legacy one-argument format remains supported for backward compatibility.
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 2:
+        await message.answer(
+            "Usage: /addchannel <channel_id> <invite_link>\n"
+            "Example: /addchannel -10047774477 https://t.me/uut"
+        )
+        return
+    target = parts[1].strip()
+    supplied_invite_link = parts[2].strip() if len(parts) == 3 else None
+    if supplied_invite_link and not re.match(r"^https?://t\.me/\S+$", supplied_invite_link, re.IGNORECASE):
+        await message.answer("❌ Please provide a valid Telegram invite link, for example https://t.me/uut")
+        return
+    try:
+        chat_ref = int(target) if target.lstrip("-").isdigit() else target
+        chat = await bot.get_chat(chat_ref)
+        if chat.type != "channel":
+            await message.answer("❌ That is not a Telegram channel. Please provide a channel username or ID.")
+            return
+        me = await bot.get_me()
+        bot_member = await bot.get_chat_member(chat.id, me.id)
+        if bot_member.status not in ("administrator", "creator"):
+            await message.answer("❌ Please make this bot an administrator in that channel first.")
+            return
+        # Prefer the exact link supplied by the owner. This lets the owner
+        # choose the invite link users should open, including private invite links.
+        join_link = supplied_invite_link
+        if not join_link:
+            join_link = f"https://t.me/{chat.username}" if chat.username else None
+        if not join_link:
+            try:
+                join_link = await bot.export_chat_invite_link(chat.id)
+            except Exception:
+                await message.answer(
+                    "❌ I couldn't create an invite link. Give the bot permission to invite users, then try again."
+                )
+                return
+        async with db.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO force_sub_channels(channel_id, title, username, invite_link)
+                   VALUES($1, $2, $3, $4)
+                   ON CONFLICT(channel_id) DO UPDATE SET title=EXCLUDED.title,
+                     username=EXCLUDED.username, invite_link=EXCLUDED.invite_link""",
+                chat.id, chat.title or "Telegram channel", chat.username, join_link,
+            )
+        await message.answer(f"✅ Force-subscription channel added: {chat.title or chat.id}")
+    except Exception:
+        log.exception("Owner could not add force-subscription channel %s", target)
+        await message.answer(
+            "❌ I couldn't access that channel. Check the channel ID/username and make sure the bot is an administrator."
+        )
+
+
+@dp.message(Command("removechannel"))
+async def remove_force_sub_channel(message: Message):
+    if not is_owner(message):
+        await message.answer("⛔ Unauthorized access.")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2:
+        await message.answer("Usage: /removechannel @ChannelUsername or /removechannel -1001234567890")
+        return
+    target = parts[1].strip()
+    async with db.acquire() as conn:
+        if target.lstrip("-").isdigit():
+            result = await conn.execute("DELETE FROM force_sub_channels WHERE channel_id=$1", int(target))
+        else:
+            username = target.removeprefix("@").lower()
+            result = await conn.execute(
+                "DELETE FROM force_sub_channels WHERE LOWER(username)= $1", username
+            )
+    if result.endswith(" 0"):
+        await message.answer("ℹ️ That channel was not in the force-subscription list.")
+    else:
+        await message.answer("✅ Force-subscription channel removed.")
+
+
+@dp.message(Command("channels"))
+async def list_force_sub_channels(message: Message):
+    if not is_owner(message):
+        await message.answer("⛔ Unauthorized access.")
+        return
+    async with db.acquire() as conn:
+        channels = await conn.fetch(
+            "SELECT title, username, channel_id FROM force_sub_channels ORDER BY added_at"
+        )
+    if not channels:
+        await message.answer("No force-subscription channels configured.")
+        return
+    lines = ["📢 Force-subscription channels:"]
+    for channel in channels:
+        handle = f"@{channel['username']}" if channel["username"] else str(channel["channel_id"])
+        lines.append(f"• {channel['title']} — {handle}")
+    await message.answer("\n".join(lines))
+
+
 @dp.message(Command("start"))
 async def start_command(message: Message):
+    if message.from_user and await send_force_sub_prompt(message, message.from_user.id):
+        return
     await message.answer(
-        "Send me a text message and I'll pass it to the processing group."
+        "👋 Welcome to SubroXgudu OSINT!\n\n"
+        "Send me your request and I'll fetch the information for you.\n"
+        "Use /help to see the available commands."
+    )
+
+
+@dp.message(Command("help"))
+async def help_command(message: Message):
+    if message.from_user and await send_force_sub_prompt(message, message.from_user.id):
+        return
+    await message.answer(
+        "All Available Commands 📖\n\n"
+    "Number to Info: /num 9093614290\n"
+    "Phone Info: /phoneinfo 9093614290\n"
+    "HP Gas Info: /hp 7074578844\n"
+    "LPG & Indian Gas Info: /gas 9093614290\n"
+    "Aadhaar Details: /aadhar 672459048432\n"
+    "Aadhaar to Family: /family 672459048432\n"
+    "Aadhaar to Ration: /a2r 512798565716\n"
+    "Number to UPI: /numtoupi 9123672075\n"
+    "PAN Details: /pan CFXPV5799D\n"
+    "PAN Details V2: /pan2 BBGPP5787F\n"
+    "Vehicle RC Info: /rc WB26AW3880\n"
+    "Vehicle RC Info 2: /rc2 HR26EV0001\n"
+    "Vehicle to Number 60%: /v2n MH47CD9112\n"
+    "Vehicle to Number 70%: /v2vn WB26AW3880\n"
+    "Vehicle Challan Check: /challan HR26EV0001\n"
+    "TG Username to Number: /tgusername redoxlala\n"
+    "TG ID to Number: /tgid 8518042438\n"
+    "IP Info: /ip 122.183.39.236\n"
+    "IMEI Info: /imei 353575360273084"
     )
 
 
@@ -614,6 +823,8 @@ async def logout_command(message: Message):
 async def handle_user_text(message: Message):
     if not message.from_user:
         return
+    if await send_force_sub_prompt(message, message.from_user.id):
+        return
     # Known bot-management commands are handled by their dedicated handlers.
     # Other slash commands (for example /Info 8283839229 or /details ABC123)
     # are treated as ordinary relay requests and forwarded unchanged to Bot 1.
@@ -639,7 +850,7 @@ async def handle_user_text(message: Message):
             """, sent.id, message.from_user.id, message.text)
         task = asyncio.create_task(timeout_request(sent.id, message.from_user.id))
         pending_timeout_tasks[sent.id] = task
-        await message.answer("✅ Your request has been sent to the processing group.")
+        await message.answer("⏳ Fetching your information...")
     except Exception:
         log.exception("Could not forward request to the private group.")
         await message.answer("❌ Could not send your request right now. Please try again later.")
@@ -648,6 +859,8 @@ async def handle_user_text(message: Message):
 @dp.message()
 async def reject_non_text(message: Message):
     if message.from_user and message.text is None:
+        if await send_force_sub_prompt(message, message.from_user.id):
+            return
         await message.answer("Please send a text message only. Photos, videos, files, audio and stickers aren't supported.")
 
 

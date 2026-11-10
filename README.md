@@ -9,7 +9,8 @@ This is the first implementation of the agreed text-only relay workflow.
 - Only messages from `BOT1_ID` are considered Bot 1 responses.
 - Bot 1's response is delivered as its original text to the originating user.
 - Each user has a 30-second cooldown.
-- `/login`, `/logout`, and `/status` are restricted to `OWNER_ID`.
+- `/login`, `/logout`, `/status`, and force-subscription channel management are restricted to `OWNER_ID`.
+- The owner can configure required Telegram channels; users must join all configured channels before using the bot.
 - Telethon session data is encrypted and stored in PostgreSQL, not in an environment variable.
 - A saved session is restored when the Railway service restarts.
 
@@ -36,6 +37,15 @@ Everything is in this one project folder:
 5. Set the Railway service start command to `python main.py` (or use the included Procfile).
 7. Set the service to **one replica**. Do not run multiple copies of the same Telethon account/session concurrently.
 
+## Force-subscription setup
+
+1. Add Bot 2 as an administrator in each required channel. It needs permission to create invite links for private channels.
+2. As the configured owner, send `/addchannel <channel_id> <invite_link>`, for example `/addchannel -10047774477 https://t.me/uut`. The bot stores the exact link you provide for the Join button. The legacy `/addchannel @ChannelUsername` or `/addchannel <channel_id>` format is also supported.
+3. Use `/channels` to view the configured channels and `/removechannel @ChannelUsername` or `/removechannel <channel_id>` to remove one.
+4. Users who have not joined every configured channel receive one Telegram Join button per channel and a final **Verify Membership** button. They must join all listed channels, then tap Verify Membership.
+
+The owner configured by `OWNER_ID` bypasses the membership requirement. Membership checks use Telegram Bot API `getChatMember`; the bot must remain an administrator in each required channel.
+
 ## First login
 
 1. Start the service.
@@ -47,6 +57,9 @@ Everything is in this one project folder:
 7. Use `/status` to verify the connection.
 
 Admin commands:
+- `/addchannel @ChannelUsername` (the bot must be an administrator in the channel)
+- `/removechannel @ChannelUsername` or `/removechannel -1001234567890`
+- `/channels`
 - `/login`
 - `/logout`
 - `/status`
