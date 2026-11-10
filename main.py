@@ -174,41 +174,100 @@ async def connect_user_client(session_string: str | None = None):
                 # Only accept messages authored by the configured Bot 1.
                 if event.sender_id != BOT1_ID:
                     return
-                # Correlation is intentionally strict: Bot 1 must reply to the
-                # exact group message sent by the user account.
+
+                response_text = event.raw_text or ""
+                if not response_text.strip():
+                    return
+
                 replied_to = event.message.reply_to_msg_id
-                if not replied_to:
-                    log.warning(
-                        "Ignored Bot 1 message %s: it was not a reply to a request.",
+                pending_row = None
+
+                async with db.acquire() as conn:
+                    if replied_to:
+                        # Preferred path: Bot 1 replies directly to the forwarded request.
+                        pending_row = await conn.fetchrow(
+                            "SELECT group_message_id, user_id FROM relay_pending WHERE group_message_id = $1",
+                            replied_to,
+                        )
+
+                    if pending_row is None:
+                        # Some processing bots post their result as a new group message.
+                        # First try to correlate its `Query: ...` line with the argument
+                        # supplied to the original command (e.g. /Info 12345).
+                        query_value = None
+                        for line in response_text.splitlines():
+                            label, separator, value = line.partition(":")
+                            if separator and label.strip().casefold() == "query":
+                                query_value = value.strip().strip("` ")
+                                break
+
+                        if query_value:
+                            rows = await conn.fetch(
+                                "SELECT group_message_id, user_id, request_text "
+                                "FROM relay_pending ORDER BY created_at ASC"
+                            )
+                            matches = []
+                            for candidate in rows:
+                                request = (candidate["request_text"] or "").strip()
+                                argument = request.split(maxsplit=1)[1].strip() if " " in request else request
+                                if argument.casefold() == query_value.casefold():
+                                    matches.append(candidate)
+                            if len(matches) == 1:
+                                pending_row = matches[0]
+
+                    if pending_row is None and not replied_to:
+                        # Safe fallback for ordinary text requests: only route when
+                        # exactly one request is pending, never guess between users.
+                        rows = await conn.fetch(
+                            "SELECT group_message_id, user_id FROM relay_pending "
+                            "ORDER BY created_at ASC LIMIT 2"
+                        )
+                        if len(rows) == 1:
+                            pending_row = rows[0]
+                        elif len(rows) > 1:
+                            log.warning(
+                                "Bot 1 sent a non-reply message while multiple requests were pending; "
+                                "cannot safely identify the recipient."
+                            )
+
+                if pending_row is None:
+                    log.info(
+                        "No unambiguous pending request matched Bot 1 message %s (reply_to=%s)",
                         event.message.id,
+                        replied_to,
                     )
                     return
-                async with db.acquire() as conn:
-                    row = await conn.fetchrow("""
-                        DELETE FROM relay_pending
-                        WHERE group_message_id = $1
-                        RETURNING user_id
-                    """, replied_to)
-                if not row:
-                    log.info("No pending request found for group message %s", replied_to)
-                    return
-                response_text = event.raw_text or ""
-                if not response_text:
-                    return
+
+                user_id = pending_row["user_id"]
                 try:
                     await bot.send_message(
-                        chat_id=row["user_id"],
+                        chat_id=user_id,
                         text=response_text,
                         parse_mode=None,
                         disable_web_page_preview=True,
                     )
                 except Exception:
-                    log.exception("Could not deliver Bot 1 response to user %s", row["user_id"])
-                task = pending_timeout_tasks.pop(replied_to, None)
+                    # Keep the pending row if delivery fails so it can be retried/debugged.
+                    log.exception("Could not deliver Bot 1 response to user %s", user_id)
+                    return
+
+                async with db.acquire() as conn:
+                    await conn.execute(
+                        "DELETE FROM relay_pending WHERE group_message_id = $1",
+                        pending_row["group_message_id"],
+                    )
+                task = pending_timeout_tasks.pop(pending_row["group_message_id"], None)
                 if task:
                     task.cancel()
+                log.info(
+                    "Delivered Bot 1 message %s to user %s for request %s",
+                    event.message.id,
+                    user_id,
+                    pending_row["group_message_id"],
+                )
             except Exception:
                 log.exception("Error processing a group response.")
+
 
         user_client = client
         log.info("Telethon account connected and authorized.")
