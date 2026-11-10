@@ -228,7 +228,7 @@ async def restore_login_client(state: dict):
 
 
 async def begin_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start one owner-only login attempt. Repeated /login never invalidates a pending OTP."""
+    """Start a simple owner-only Telegram login using one in-memory Telethon client."""
     global login_client
     user = update.effective_user
     msg = update.effective_message
@@ -241,33 +241,29 @@ async def begin_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     async with login_lock:
-        state = login_state.get(user.id) or await read_login_attempt(user.id)
-        if state:
-            login_state[user.id] = state
-            try:
-                await restore_login_client(state)
-            except Exception:
-                log.exception("Could not restore the pending login connection")
-                await msg.reply_text("The pending login connection could not be restored. Send /cancel, then /login once.")
-                return
-            if state["step"] == "code":
-                await msg.reply_text("A login code has already been requested. Enter the newest code from that request; /login will not request another code.")
-            elif state["step"] == "password":
-                await msg.reply_text("A login is waiting for your Telegram 2FA password. Send it now, or /cancel.")
-            else:
-                await msg.reply_text("Login is waiting for your phone number with country code (example: +91XXXXXXXXXX).")
+        # Match the previous working login flow: keep one Telethon client alive
+        # from send_code_request() through sign_in(). Do not recreate it from a
+        # saved StringSession or reuse a persisted phone_code_hash while waiting
+        # for the OTP.
+        if login_client and login_client.is_connected():
+            await msg.reply_text("A login is already in progress. Enter the Telegram code that was sent, or send /cancel.")
             return
+
+        if login_client:
+            try:
+                await login_client.disconnect()
+            except Exception:
+                log.exception("Could not close stale login client")
+            login_client = None
 
         login_client = TelegramClient(StringSession(), int(TELETHON_API_ID), TELETHON_API_HASH)
         await login_client.connect()
-        state = {"step": "phone", "session_string": login_client.session.save()}
-        login_state[user.id] = state
-        await store_login_attempt(user.id, state)
+        login_state[user.id] = {"step": "phone"}
         await msg.reply_text("Send your Telegram phone number with country code (example: +91XXXXXXXXXX). Send /cancel to stop.")
 
 
 async def process_login_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Consume owner login replies using one persistent auth key and one code hash."""
+    """Complete the owner login using the same Telethon client that requested the code."""
     global telethon_client, login_client
     user = update.effective_user
     msg = update.effective_message
@@ -275,20 +271,18 @@ async def process_login_message(update: Update, context: ContextTypes.DEFAULT_TY
         return False
 
     async with login_lock:
-        state = login_state.get(user.id) or await read_login_attempt(user.id)
-        if not state:
+        state = login_state.get(user.id)
+        if not state or not login_client:
             return False
-        login_state[user.id] = state
         value = (msg.text or "").strip()
 
         if value.lower() == "/cancel":
-            if login_client:
-                try:
-                    await login_client.disconnect()
-                except Exception:
-                    log.exception("Failed to close cancelled login client")
-                login_client = None
-            await clear_login_attempt(user.id)
+            try:
+                await login_client.disconnect()
+            except Exception:
+                log.exception("Failed to close cancelled login client")
+            login_client = None
+            login_state.pop(user.id, None)
             await msg.reply_text("Login cancelled.")
             return True
 
@@ -297,22 +291,21 @@ async def process_login_message(update: Update, context: ContextTypes.DEFAULT_TY
             return True
 
         try:
-            await restore_login_client(state)
+            if not login_client.is_connected():
+                await login_client.connect()
 
             if state["step"] == "phone":
                 phone = "".join(value.split())
                 if not phone.startswith("+") or not phone[1:].isdigit():
                     await msg.reply_text("Send the phone number in international format, for example +91XXXXXXXXXX.")
                     return True
-                sent_code = await login_client.send_code_request(phone)
-                state.update({
-                    "step": "code",
-                    "phone": phone,
-                    "phone_code_hash": sent_code.phone_code_hash,
-                })
-                await store_login_attempt(user.id, state)
-                log.info("One Telegram login code requested; code hash stored with the same temporary session")
-                await msg.reply_text("Telegram sent a login code. Enter the newest code from this request. Do not send /login again while entering it.")
+
+                # Keep the exact same client alive until sign_in(). Telethon then
+                # retains the code request/hash internally, as in the old working
+                # auth_session.py flow.
+                await login_client.send_code_request(phone)
+                state.update({"step": "code", "phone": phone})
+                await msg.reply_text("Telegram sent a login code. Enter that code now. Do not send /login again while entering it.")
                 return True
 
             if state["step"] == "code":
@@ -320,7 +313,12 @@ async def process_login_message(update: Update, context: ContextTypes.DEFAULT_TY
                 if not code:
                     await msg.reply_text("Enter the numeric Telegram login code, or send /cancel.")
                     return True
-                await login_client.sign_in(phone=state["phone"], code=code, phone_code_hash=state["phone_code_hash"])
+
+                # Deliberately omit phone_code_hash. Telethon uses the hash held
+                # by this same client from send_code_request(), matching the old
+                # successful login implementation.
+                await login_client.sign_in(phone=state["phone"], code=code)
+
             elif state["step"] == "password":
                 await login_client.sign_in(password=value)
             else:
@@ -333,41 +331,41 @@ async def process_login_message(update: Update, context: ContextTypes.DEFAULT_TY
                 old_client = telethon_client
                 telethon_client = new_client
                 login_client = None
+                login_state.pop(user.id, None)
                 await save_session(state.get("phone") or "authorized-session")
-                await clear_login_attempt(user.id)
                 if old_client and old_client is not new_client:
                     await old_client.disconnect()
                 await msg.reply_text("Telegram account authorized and session saved in PostgreSQL. Relay is ready.")
                 log.info("Owner login completed; authorized session saved")
                 return True
 
-            await store_login_attempt(user.id, state)
             await msg.reply_text("Authorization is not complete yet. Follow the next prompt or send /cancel.")
             return True
 
         except SessionPasswordNeededError:
             state["step"] = "password"
-            await store_login_attempt(user.id, state)
             await msg.reply_text("Two-step verification is enabled. Send your Telegram 2FA password here.")
             return True
         except PhoneCodeExpiredError:
-            log.warning("Telegram says the phone code/hash expired; clearing only this attempt")
-            if login_client:
+            log.warning("Telegram says the phone code expired")
+            try:
                 await login_client.disconnect()
-                login_client = None
-            await clear_login_attempt(user.id)
-            await msg.reply_text("Telegram has expired this login code. Send /login once to request a new code.")
+            except Exception:
+                log.exception("Could not close expired login client")
+            login_client = None
+            login_state.pop(user.id, None)
+            await msg.reply_text("Telegram has expired this login code. Send /login once to start a completely new login attempt.")
             return True
         except PhoneCodeInvalidError:
-            log.warning("Telegram rejected the submitted code as invalid; preserving the active attempt")
-            await msg.reply_text("Telegram says this code is incorrect. The current login attempt is still active; enter the code from its original message.")
+            log.warning("Telegram rejected the submitted code as invalid")
+            await msg.reply_text("Telegram says this code is incorrect. Enter the code from the login message that was sent for this attempt.")
             return True
         except FloodWaitError as exc:
             await msg.reply_text(f"Telegram is limiting login attempts. Wait {exc.seconds} seconds before requesting another code.")
             return True
         except Exception as exc:
             log.exception("Telethon login step failed")
-            await msg.reply_text(f"Login step failed ({type(exc).__name__}). The pending attempt was preserved; try again or send /cancel.")
+            await msg.reply_text(f"Login step failed ({type(exc).__name__}). Send /cancel and start a new login attempt if needed.")
             return True
 
 
