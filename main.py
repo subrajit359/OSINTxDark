@@ -9,7 +9,12 @@ from typing import Optional
 import asyncpg
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import (
+    SessionPasswordNeededError,
+    PhoneCodeExpiredError,
+    PhoneCodeInvalidError,
+    FloodWaitError,
+)
 from telethon.sessions import StringSession
 from telegram import Update
 from telegram.constants import ChatType
@@ -185,7 +190,11 @@ async def begin_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not TELETHON_API_ID or not TELETHON_API_HASH:
         await msg.reply_text("Set TELETHON_API_ID and TELETHON_API_HASH in Render Environment first.")
         return
+    # A new /login starts a clean authorization attempt; never reuse an old code hash.
     login_state[user.id] = {"step": "phone"}
+    if not telethon_client or not telethon_client.is_connected():
+        await msg.reply_text("Telegram login service is reconnecting. Please send /login again in a moment.")
+        return
     await msg.reply_text("Send your Telegram phone number with country code (example: +91XXXXXXXXXX). Send /cancel to stop.")
 
 
@@ -206,14 +215,19 @@ async def process_login_message(update: Update, context: ContextTypes.DEFAULT_TY
         return True
     try:
         if state["step"] == "phone":
-            phone = value.replace(" ", "")
+            phone = "".join(value.split())
             sent_code = await telethon_client.send_code_request(phone)
-            state.update({"step": "code", "phone": phone, "phone_code_hash": sent_code.phone_code_hash})
-            await msg.reply_text("Telegram login code requested. Send the code here.")
+            state.update({
+                "step": "code",
+                "phone": phone,
+                "phone_code_hash": sent_code.phone_code_hash,
+            })
+            await msg.reply_text("Telegram sent a login code. Enter the newest code here. If Telegram sends another code, use only the latest one. Do not send /login again while entering this code.")
             return True
         if state["step"] == "code":
+            code = "".join(value.split()).replace("-", "")
             await telethon_client.sign_in(
-                phone=state["phone"], code=value,
+                phone=state["phone"], code=code,
                 phone_code_hash=state["phone_code_hash"],
             )
         elif state["step"] == "password":
@@ -228,9 +242,29 @@ async def process_login_message(update: Update, context: ContextTypes.DEFAULT_TY
         state["step"] = "password"
         await msg.reply_text("Two-step verification is enabled. Send your Telegram 2FA password here.")
         return True
+    except PhoneCodeExpiredError:
+        # Telegram invalidates a previous OTP when a newer code is requested.
+        # Refresh the hash and ask for the newly issued code instead of reusing the expired hash.
+        try:
+            sent_code = await telethon_client.send_code_request(state["phone"])
+            state["phone_code_hash"] = sent_code.phone_code_hash
+            state["step"] = "code"
+            await msg.reply_text("Telegram says that code has expired. I requested a fresh login code. Enter the NEWEST code Telegram sends; ignore all older codes.")
+        except Exception as resend_exc:
+            log.warning("Could not refresh expired Telegram code: %s", type(resend_exc).__name__)
+            login_state.pop(user.id, None)
+            await msg.reply_text("The login code expired and Telegram could not issue another code. Send /login to start a fresh attempt, then use the newest code immediately.")
+        return True
+    except PhoneCodeInvalidError:
+        await msg.reply_text("That code was not accepted. Enter the newest Telegram login code exactly as received, or send /cancel and start again with /login.")
+        return True
+    except FloodWaitError as exc:
+        await msg.reply_text(f"Telegram is limiting new login attempts. Wait {exc.seconds} seconds, then send /login again.")
+        login_state.pop(user.id, None)
+        return True
     except Exception as exc:
         log.warning("Telethon login step failed: %s", type(exc).__name__)
-        await msg.reply_text(f"Login step failed ({type(exc).__name__}). Check the value and try again, or send /cancel.")
+        await msg.reply_text(f"Login step failed ({type(exc).__name__}). Send /cancel and start a fresh /login attempt.")
         return True
     await msg.reply_text("Authorization is not complete yet. Follow the next prompt or send /cancel.")
     return True
