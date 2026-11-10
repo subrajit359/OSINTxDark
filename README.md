@@ -1,6 +1,6 @@
 # GAMERZONE Smart Lookup — Python Telegram Bot
 
-Single-folder Python service for Railway. It uses:
+Single-folder Python service for Render (Background Worker) or Railway. It uses:
 - `python-telegram-bot` for the public Bot 2 interface.
 - Telethon for the owner-authorized Telegram account relay into the private group.
 - PostgreSQL for the Telethon session and request/delivery tracking.
@@ -27,6 +27,19 @@ Also set `OWNER_ID` to the owner's numeric Telegram user ID. Do not paste secret
 - Build: `pip install -r requirements.txt`
 - Start: `python main.py`
 - Add a PostgreSQL service and set `DATABASE_URL` to its valid connection URL (or use your existing Neon URL).
+
+
+## Render deployment
+
+Deploy this folder as a **Background Worker** (not a Web Service):
+
+- Runtime: Python 3
+- Build command: `pip install -r requirements.txt`
+- Start command: `python main.py`
+- Add all required environment variables listed above in the Render service settings. Set `LOG_LEVEL` to `INFO` (uppercase is recommended; lowercase is also accepted).
+- Attach a PostgreSQL database and set `DATABASE_URL` to its internal connection URL when the database is in the same Render region.
+
+The included `render.yaml` provides the worker build and start commands. It does not create or populate your secrets/database settings automatically.
 
 ## Owner login
 

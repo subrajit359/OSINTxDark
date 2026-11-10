@@ -17,11 +17,24 @@ from telegram.constants import ChatType
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 load_dotenv()
+# Render environment values may be lowercase (for example: "info").
+# Normalize the value and fall back safely if it is not a valid level.
 _log_level_name = os.getenv("LOG_LEVEL", "INFO").strip().upper()
-_log_level = getattr(logging, _log_level_name, logging.INFO)
-if not isinstance(_log_level, int):
-    _log_level = logging.INFO
-logging.basicConfig(level=_log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+_log_levels = {
+    "CRITICAL": logging.CRITICAL,
+    "FATAL": logging.FATAL,
+    "ERROR": logging.ERROR,
+    "WARNING": logging.WARNING,
+    "WARN": logging.WARNING,
+    "INFO": logging.INFO,
+    "DEBUG": logging.DEBUG,
+    "NOTSET": logging.NOTSET,
+}
+_log_level = _log_levels.get(_log_level_name, logging.INFO)
+logging.basicConfig(
+    level=_log_level,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 log = logging.getLogger("gamerzone")
 
 # Keep the user's existing Railway variable names unchanged.
