@@ -1,56 +1,42 @@
-# GAMERZONE Smart Lookup — Python Telegram Bot
+# GAMERZONE Telegram Relay
 
-Single-folder Python service for Railway. It uses:
-- `python-telegram-bot` for the public Bot 2 interface.
-- Telethon for the owner-authorized Telegram account relay into the private group.
-- PostgreSQL for the Telethon session and request/delivery tracking.
+Bot 2 is an automatic message relay. It has no public command menu or command restrictions.
 
-## Existing environment variable names
+## Message flow
 
-The application keeps the original variable names unchanged:
+1. Any message sent to Bot 2 in a private chat is forwarded to the configured private group.
+2. The forwarded group message includes the sender's Telegram user ID and a unique request ID.
+3. When Bot 1 replies directly to that forwarded message, the relay captures the reply.
+4. Bot 2 sends the captured text or supported media to the original user.
 
-- `BOT_TOKEN`
-- `GROUP_ID`
-- `BOT1_ID` (retained for compatibility; reply correlation uses the reply-to message ID)
+Text, photos, videos, audio, documents, voice messages, stickers and other Telegram attachments supported by the Bot API are forwarded. Location, contact, venue, poll and dice messages are converted to readable text for the group.
+
+## Environment variables
+
+Keep these existing variable names in Railway:
+
+- `BOT_TOKEN` — Bot 2 token
+- `GROUP_ID` — private group ID
+- `BOT1_ID` — Bot 1 numeric Telegram user ID; used to accept replies only from Bot 1
 - `TELETHON_API_ID`
 - `TELETHON_API_HASH`
-- `TELETHON_PHONE` (optional default for `/login`)
-- `DATABASE_URL`
-- `RESPONSE_TIMEOUT_SECONDS`
-- `RESPONSE_SETTLE_SECONDS`
+- `TELETHON_PHONE` — retained for compatibility
+- `DATABASE_URL` — PostgreSQL connection URL
+- `RESPONSE_SETTLE_SECONDS` — optional, default `1.0`
+- `RESPONSE_TIMEOUT_SECONDS` — retained for compatibility; no timeout message is sent
 
-Also set `OWNER_ID` to the owner's numeric Telegram user ID. Do not paste secrets into GitHub or share them in chat.
+The Telethon user session must already be authorized and stored in the PostgreSQL `gz_telegram_session` table. The public bot has no `/login`, `/help`, `/start`, or lookup command handlers; every incoming private-chat message is treated as a user message and relayed.
 
-## Railway
+## Railway deployment
 
 - Root Directory: `/`
-- Build: `pip install -r requirements.txt`
-- Start: `python main.py`
-- Add a PostgreSQL service and set `DATABASE_URL` to its valid connection URL (or use your existing Neon URL).
+- Build command: `pip install -r requirements.txt`
+- Start command: `python main.py`
+- Attach PostgreSQL and set `DATABASE_URL`.
 
-## Owner login
+## Telegram setup
 
-In a private chat with Bot 2:
-
-1. `/login` (or `/login +countrycode...`)
-2. If prompted, send your phone number.
-3. `/otp 12345`
-4. If Telegram requires 2-step verification, `/password your-2fa-password`
-5. `/session` checks connection status.
-
-The OTP and password are held only in process memory during the login flow. Telegram message deletion is best-effort and cannot guarantee removal from every client notification/history.
-
-## Commands and privacy
-
-`/start`, `/help`, `/id`, `/login`, `/otp`, `/password`, `/cancel_login`, `/session`, `/ip`.
-
-The legacy personal-data commands (phone-owner lookup, Aadhaar, PAN, family/ration records, phone-to-UPI, Telegram ID/username-to-phone, vehicle-owner-to-number and IMEI lookups) are deliberately not exposed by this public bot because they can disclose sensitive personal data. `/ip` accepts a syntactically valid IP address; actual lookup processing still depends on a permitted upstream service replying to the request in the private group.
-
-## Important operational notes
-
-- Bot 1 must already be present in the private group and process commands there.
-- Add the Telethon account to that group and ensure it can send/read messages.
-- The bot API account (Bot 2) and the Telethon user account are separate identities.
-- The relay correlates replies by Telegram `reply_to_msg_id`. If Bot 1 does not reply to the exact request message (or its tracked intermediate reply), this minimal relay will not match it; test the actual Bot 1 reply pattern before production use.
-- The Telethon session stored in PostgreSQL is highly sensitive. Restrict database access and rotate it if exposed.
-- This is a Python migration scaffold and has not been tested against your live Telegram group, Bot 1, or Railway database.
+- Add Bot 1 to the private group and ensure it can process the forwarded messages.
+- Add the Telethon account to the same group with permission to send and read messages.
+- Configure `BOT1_ID` with Bot 1's numeric Telegram ID.
+- Bot 1 must reply directly to the forwarded request message so the relay can associate the result with the correct user.
