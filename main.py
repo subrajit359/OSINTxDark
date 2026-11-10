@@ -17,24 +17,11 @@ from telegram.constants import ChatType
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 load_dotenv()
-# Render environment values may be lowercase (for example: "info").
-# Normalize the value and fall back safely if it is not a valid level.
 _log_level_name = os.getenv("LOG_LEVEL", "INFO").strip().upper()
-_log_levels = {
-    "CRITICAL": logging.CRITICAL,
-    "FATAL": logging.FATAL,
-    "ERROR": logging.ERROR,
-    "WARNING": logging.WARNING,
-    "WARN": logging.WARNING,
-    "INFO": logging.INFO,
-    "DEBUG": logging.DEBUG,
-    "NOTSET": logging.NOTSET,
-}
-_log_level = _log_levels.get(_log_level_name, logging.INFO)
-logging.basicConfig(
-    level=_log_level,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+_log_level = getattr(logging, _log_level_name, logging.INFO)
+if not isinstance(_log_level, int):
+    _log_level = logging.INFO
+logging.basicConfig(level=_log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("gamerzone")
 
 # Keep the user's existing Railway variable names unchanged.
@@ -50,11 +37,9 @@ RESPONSE_TIMEOUT_SECONDS = float(os.getenv("RESPONSE_TIMEOUT_SECONDS", "15"))
 RESPONSE_SETTLE_SECONDS = float(os.getenv("RESPONSE_SETTLE_SECONDS", "1.0"))
 SUPPORT_FOOTER = "\n\n📩 Any issue? Contact @subro98 / @gudugaming8069"
 
-# Public lookup is intentionally limited to non-sensitive public information.
-# Identity, personal contact, family, Aadhaar/PAN, owner tracing and device-ID
-# lookups are not exposed by this public bot.
+# Only explicitly supported public-information commands are available.
 PUBLIC_COMMANDS = {"ip": "Public IP address information"}
-RESTRICTED_COMMANDS = {
+UNAVAILABLE_COMMANDS = {
     "num", "phoneinfo", "hp", "gas", "aadhar", "family", "a2r",
     "numtoupi", "pan", "pan2", "rc", "rc2", "v2n", "v2vn",
     "challan", "tgusername", "tgid", "imei",
@@ -184,9 +169,9 @@ async def on_group_message(event):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lines = ["🎮 GAMERZONE Smart Lookup", "", "Available public-information commands:"]
+    lines = ["🎮 GAMERZONE Smart Lookup", "", "Available commands:"]
     lines += [f"/{cmd} — {desc}" for cmd, desc in PUBLIC_COMMANDS.items()]
-    lines += ["", "Example: /ip 8.8.8.8", "Personal identity, contact, family, owner-tracing and device-ID lookups are disabled."]
+    lines += ["", "Example: /ip 8.8.8.8"]
     await send_text(update, "\n".join(lines))
 
 
@@ -309,8 +294,8 @@ async def lookup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_text(update, "Please use this bot in a private chat.")
         return
     command = update.effective_message.text.split()[0].split("@")[0].lstrip("/").lower()
-    if command in RESTRICTED_COMMANDS:
-        await send_text(update, "⛔ This lookup is disabled because it can expose sensitive personal, identity, family, contact, vehicle-owner, account or device information.")
+    if command in UNAVAILABLE_COMMANDS:
+        await send_text(update, "This command is currently unavailable.")
         return
     if command not in PUBLIC_COMMANDS:
         await send_text(update, "Unknown or unavailable command. Send /help.")
@@ -397,7 +382,7 @@ async def main():
     bot_app.add_handler(CommandHandler("password", password_command))
     bot_app.add_handler(CommandHandler(["cancel_login", "cancel"], cancel_login))
     bot_app.add_handler(CommandHandler("session", session_command))
-    for cmd in set(PUBLIC_COMMANDS) | RESTRICTED_COMMANDS:
+    for cmd in set(PUBLIC_COMMANDS) | UNAVAILABLE_COMMANDS:
         bot_app.add_handler(CommandHandler(cmd, lookup_command))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     log.info("GAMERZONE Python bot starting")
