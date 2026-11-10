@@ -67,11 +67,11 @@ def is_owner(message: Message) -> bool:
     return bool(message.from_user and message.from_user.id == OWNER_ID)
 
 
-def clean_relay_request(text: str) -> str:
-    """Remove the Dibakar name and every @username mention before relaying."""
-    text = re.sub(r"(?i)\bDibakar\b", "", text)
-    text = re.sub(r"(?<!\w)@[A-Za-z0-9_]+", "", text)
-    # Trim excess horizontal whitespace without flattening intentional newlines.
+def clean_bot1_reply(text: str) -> str:
+    """Remove attribution to Dibakar and @username mentions from Bot 1's reply."""
+    text = re.sub(r"(?i)\brequested\s+by\s+Dibakar\b[:,]?", "", text)
+    text = re.sub(r"(?<![\w])@[A-Za-z0-9_]+", "", text)
+    # Keep the reply's line structure while removing empty lines and extra spaces.
     lines = [re.sub(r"[ \t]{2,}", " ", line).strip() for line in text.splitlines()]
     return "\n".join(line for line in lines if line).strip()
 
@@ -193,8 +193,9 @@ async def connect_user_client(session_string: str | None = None):
                 if event.sender_id != BOT1_ID:
                     return
 
-                response_text = event.raw_text or ""
-                if not response_text.strip():
+                response_text = clean_bot1_reply(event.raw_text or "")
+                if not response_text:
+                    log.info("Bot 1 response %s contained only attribution/mentions; nothing to deliver.", event.message.id)
                     return
 
                 replied_to = event.message.reply_to_msg_id
@@ -601,13 +602,8 @@ async def handle_user_text(message: Message):
     if client is None or not client.is_connected():
         await message.answer("⚠️ The service is temporarily unavailable. Please try again later.")
         return
-    cleaned_text = clean_relay_request(message.text)
-    if not cleaned_text:
-        await message.answer("Please send a request after removing the name and @username mentions.")
-        return
-
     try:
-        sent = await client.send_message(GROUP_ID, cleaned_text)
+        sent = await client.send_message(GROUP_ID, message.text)
         async with db.acquire() as conn:
             await conn.execute("""
                 INSERT INTO relay_pending(group_message_id, user_id, request_text)
@@ -616,7 +612,7 @@ async def handle_user_text(message: Message):
                 SET user_id = EXCLUDED.user_id,
                     request_text = EXCLUDED.request_text,
                     created_at = NOW()
-            """, sent.id, message.from_user.id, cleaned_text)
+            """, sent.id, message.from_user.id, message.text)
         task = asyncio.create_task(timeout_request(sent.id, message.from_user.id))
         pending_timeout_tasks[sent.id] = task
         await message.answer("✅ Your request has been sent to the processing group.")
