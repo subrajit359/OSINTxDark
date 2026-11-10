@@ -245,63 +245,62 @@ async def connect_user_client(session_string: str | None = None):
                 replied_to = event.message.reply_to_msg_id
                 pending_row = None
 
-                async with db.acquire() as conn:
-                    if replied_to:
-                        # Match a reply to the original request, or to any earlier
-                        # Bot 1 response belonging to that request (multi-part replies).
-                        pending_row = await conn.fetchrow(
-                            "SELECT p.group_message_id, p.user_id FROM relay_pending p "
-                            "WHERE p.group_message_id = $1",
-                            replied_to,
-                        )
-                        if pending_row is None:
+                # Bot 1 can answer immediately after Telethon sends the request.
+                # The send_message() coroutine may return before the request mapping
+                # has been committed to PostgreSQL, so briefly retry the lookup.
+                for lookup_attempt in range(10):
+                    async with db.acquire() as conn:
+                        if replied_to:
+                            # Match the original request or any earlier Bot 1 response
+                            # belonging to the same request (multi-part replies).
                             pending_row = await conn.fetchrow(
-                                "SELECT p.group_message_id, p.user_id "
-                                "FROM relay_response_messages r "
-                                "JOIN relay_pending p ON p.group_message_id = r.group_message_id "
-                                "WHERE r.response_message_id = $1",
+                                "SELECT p.group_message_id, p.user_id FROM relay_pending p "
+                                "WHERE p.group_message_id = $1",
                                 replied_to,
                             )
+                            if pending_row is None:
+                                pending_row = await conn.fetchrow(
+                                    "SELECT p.group_message_id, p.user_id "
+                                    "FROM relay_response_messages r "
+                                    "JOIN relay_pending p ON p.group_message_id = r.group_message_id "
+                                    "WHERE r.response_message_id = $1",
+                                    replied_to,
+                                )
 
-                    if pending_row is None:
-                        # Some processing bots post their result as a new group message.
-                        # First try to correlate its `Query: ...` line with the argument
-                        # supplied to the original command (e.g. /Info 12345).
-                        query_value = None
-                        for line in response_text.splitlines():
-                            label, separator, value = line.partition(":")
-                            if separator and label.strip().casefold() == "query":
-                                query_value = value.strip().strip("` ")
-                                break
+                        if pending_row is None:
+                            # Correlate standalone responses with a unique Query line.
+                            query_value = None
+                            for line in response_text.splitlines():
+                                label, separator, value = line.partition(":")
+                                if separator and label.strip().casefold() == "query":
+                                    query_value = value.strip().strip("` ")
+                                    break
+                            if query_value:
+                                rows = await conn.fetch(
+                                    "SELECT group_message_id, user_id, request_text "
+                                    "FROM relay_pending ORDER BY created_at ASC"
+                                )
+                                matches = []
+                                for candidate in rows:
+                                    request = (candidate["request_text"] or "").strip()
+                                    argument = request.split(maxsplit=1)[1].strip() if " " in request else request
+                                    if argument.casefold() == query_value.casefold():
+                                        matches.append(candidate)
+                                if len(matches) == 1:
+                                    pending_row = matches[0]
 
-                        if query_value:
+                        if pending_row is None and not replied_to:
                             rows = await conn.fetch(
-                                "SELECT group_message_id, user_id, request_text "
-                                "FROM relay_pending ORDER BY created_at ASC"
+                                "SELECT group_message_id, user_id FROM relay_pending "
+                                "ORDER BY created_at ASC LIMIT 2"
                             )
-                            matches = []
-                            for candidate in rows:
-                                request = (candidate["request_text"] or "").strip()
-                                argument = request.split(maxsplit=1)[1].strip() if " " in request else request
-                                if argument.casefold() == query_value.casefold():
-                                    matches.append(candidate)
-                            if len(matches) == 1:
-                                pending_row = matches[0]
+                            if len(rows) == 1:
+                                pending_row = rows[0]
 
-                    if pending_row is None and not replied_to:
-                        # Safe fallback for ordinary text requests: only route when
-                        # exactly one request is pending, never guess between users.
-                        rows = await conn.fetch(
-                            "SELECT group_message_id, user_id FROM relay_pending "
-                            "ORDER BY created_at ASC LIMIT 2"
-                        )
-                        if len(rows) == 1:
-                            pending_row = rows[0]
-                        elif len(rows) > 1:
-                            log.warning(
-                                "Bot 1 sent a non-reply message while multiple requests were pending; "
-                                "cannot safely identify the recipient."
-                            )
+                    if pending_row is not None:
+                        break
+                    if lookup_attempt < 9:
+                        await asyncio.sleep(0.2)
 
                 if pending_row is None:
                     log.info(
@@ -340,11 +339,21 @@ async def connect_user_client(session_string: str | None = None):
                         event.message.id,
                         pending_row["group_message_id"],
                     )
+                # Keep the request mapping alive for REQUEST_TIMEOUT_SECONDS after
+                # the most recent response, allowing delayed follow-up messages.
+                request_id = pending_row["group_message_id"]
+                old_timeout = pending_timeout_tasks.get(request_id)
+                if old_timeout and not old_timeout.done():
+                    old_timeout.cancel()
+                pending_timeout_tasks[request_id] = asyncio.create_task(
+                    timeout_request(request_id, user_id)
+                )
+
                 log.info(
                     "Delivered Bot 1 message %s to user %s for request %s",
                     event.message.id,
                     user_id,
-                    pending_row["group_message_id"],
+                    request_id,
                 )
             except Exception:
                 log.exception("Error processing a group response.")
@@ -639,6 +648,7 @@ async def handle_user_text(message: Message):
     # are treated as ordinary relay requests and forwarded unchanged to Bot 1.
     remaining = await check_and_set_cooldown(message.from_user.id)
     if remaining:
+        # Cooldown notices are private Bot 2 replies only; do not send them to GROUP_ID.
         await message.answer(f"⏳ Please wait {remaining} seconds before sending another message.")
         return
 
