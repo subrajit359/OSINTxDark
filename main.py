@@ -490,9 +490,9 @@ async def logout_command(message: Message):
 async def handle_user_text(message: Message):
     if not message.from_user:
         return
-    # Admin commands and other slash commands are not forwarded as requests.
-    if (message.text or "").startswith("/"):
-        return
+    # Known bot-management commands are handled by their dedicated handlers.
+    # Other slash commands (for example /Info 8283839229 or /details ABC123)
+    # are treated as ordinary relay requests and forwarded unchanged to Bot 1.
     remaining = await check_and_set_cooldown(message.from_user.id)
     if remaining:
         await message.answer(f"⏳ Please wait {remaining} seconds before sending another message.")
@@ -515,7 +515,7 @@ async def handle_user_text(message: Message):
             """, sent.id, message.from_user.id, message.text)
         task = asyncio.create_task(timeout_request(sent.id, message.from_user.id))
         pending_timeout_tasks[sent.id] = task
-        await message.answer("✅ Your text request has been sent.")
+        await message.answer("✅ Your request has been sent to the processing group.")
     except Exception:
         log.exception("Could not forward request to the private group.")
         await message.answer("❌ Could not send your request right now. Please try again later.")

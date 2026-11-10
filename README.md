@@ -4,7 +4,7 @@ This is the first implementation of the agreed text-only relay workflow.
 
 ## What it does
 
-- Bot 2 accepts text messages only.
+- Bot 2 accepts plain text and command-style text requests, such as `/Info 8283839229` and `/details Jdjsj728`.
 - A logged-in Telegram user account (Telethon) sends each request to the configured private group.
 - Only messages from `BOT1_ID` are considered Bot 1 responses.
 - Bot 1's response is delivered as its original text to the originating user.
@@ -54,7 +54,9 @@ Admin commands:
 
 ## Notes and limitations in this initial version
 
-- Text only. Photos, videos, documents, voice/audio, stickers and other non-text messages are rejected.
+- Text only, including slash-command-style requests. For example, `/Info 8283839229` and `/details Jdjsj728` are forwarded unchanged to the processing group.
+- Bot management commands such as `/start`, `/login`, `/status`, `/logout`, and `/cancel` remain reserved for Bot 2 and are not forwarded.
+- Photos, videos, documents, voice/audio, stickers and other non-text messages are rejected.
 - Default Bot 1 response timeout is 120 seconds. Change `REQUEST_TIMEOUT_SECONDS` if needed.
 - The 30-second cooldown is per Telegram user.
 - A response must be a text reply to the exact forwarded group message.
