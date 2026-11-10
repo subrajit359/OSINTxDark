@@ -1,543 +1,559 @@
 import asyncio
-import io
+import json
 import logging
 import os
-import uuid
+import time
 from datetime import datetime, timezone
-from typing import Optional
 
 import asyncpg
-from dotenv import load_dotenv
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import Message
+from cryptography.fernet import Fernet, InvalidToken
 from telethon import TelegramClient, events
 from telethon.errors import (
-    SessionPasswordNeededError,
     PhoneCodeExpiredError,
     PhoneCodeInvalidError,
-    FloodWaitError,
+    PhoneNumberInvalidError,
+    SessionPasswordNeededError,
 )
 from telethon.sessions import StringSession
-from telegram import Update
-from telegram.constants import ChatType
-from telegram.ext import Application, MessageHandler, ContextTypes, filters
 
-load_dotenv()
-_log_level_name = os.getenv("LOG_LEVEL", "INFO").strip().upper()
-_log_level = getattr(logging, _log_level_name, logging.INFO)
-if not isinstance(_log_level, int):
-    _log_level = logging.INFO
-logging.basicConfig(level=_log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-log = logging.getLogger("gamerzone")
+# ----------------------------- Configuration -----------------------------
 
-# Keep the user's existing Railway variable names unchanged.
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-OWNER_ID = os.getenv("OWNER_ID", "").strip()
-GROUP_ID = os.getenv("GROUP_ID", "").strip()
-BOT1_ID = os.getenv("BOT1_ID", "").strip()
-TELETHON_API_ID = os.getenv("TELETHON_API_ID", "").strip()
-TELETHON_API_HASH = os.getenv("TELETHON_API_HASH", "").strip()
-TELETHON_PHONE = os.getenv("TELETHON_PHONE", "").strip()
-TELETHON_SESSION = os.getenv("TELETHON_SESSION", "").strip()
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-RESPONSE_TIMEOUT_SECONDS = float(os.getenv("RESPONSE_TIMEOUT_SECONDS", "3600"))
-RESPONSE_SETTLE_SECONDS = float(os.getenv("RESPONSE_SETTLE_SECONDS", "1.0"))
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+OWNER_ID = int(os.environ["OWNER_ID"])
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+GROUP_ID = int(os.environ["GROUP_ID"])
+BOT1_ID = int(os.environ["BOT1_ID"])
+DATABASE_URL = os.environ["DATABASE_URL"]
+# Keep this key unchanged: it encrypts/decrypts the Telethon session stored in PostgreSQL.
+SESSION_ENCRYPTION_KEY = "t9Shlqawj8CSegGkCtMyOczWAjsoR8jZ788t2Z_UO6g="
+REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "120"))
+COOLDOWN_SECONDS = 30
 
-pool: Optional[asyncpg.Pool] = None
-instance_lock_conn = None
-telethon_client: Optional[TelegramClient] = None
-bot_app: Optional[Application] = None
-login_state: dict = {}
-login_client: Optional[TelegramClient] = None
-login_lock = asyncio.Lock()
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("telegram-relay")
+
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
+db: asyncpg.Pool | None = None
+user_client: TelegramClient | None = None
+telethon_lock = asyncio.Lock()
+cooldown_lock = asyncio.Lock()
+pending_timeout_tasks: dict[int, asyncio.Task] = {}
+fernet = Fernet(SESSION_ENCRYPTION_KEY.encode())
 
 
-def owner_ok(user_id: int) -> bool:
-    return bool(OWNER_ID) and str(user_id) == OWNER_ID
+class LoginFlow(StatesGroup):
+    phone = State()
+    code = State()
+    password = State()
 
 
-async def db_init():
-    global pool
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5, command_timeout=30)
-    async with pool.acquire() as con:
-        await con.execute("""
-        CREATE TABLE IF NOT EXISTS gz_telegram_session (
-            id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-            session_string TEXT NOT NULL,
-            phone TEXT,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-        """)
-        await con.execute("""
-        CREATE TABLE IF NOT EXISTS gz_query_requests (
-            request_id TEXT PRIMARY KEY,
-            command TEXT NOT NULL,
-            query_text TEXT NOT NULL,
-            telegram_message_id BIGINT,
-            bot_reply_message_id BIGINT,
-            status TEXT NOT NULL DEFAULT 'pending',
-            result TEXT,
-            error_message TEXT,
-            result_media BYTEA,
-            result_mime_type TEXT,
-            result_file_name TEXT,
-            result_caption TEXT,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-        """)
-        await con.execute("ALTER TABLE gz_query_requests ADD COLUMN IF NOT EXISTS bot_reply_message_id BIGINT")
-        await con.execute("ALTER TABLE gz_query_requests ADD COLUMN IF NOT EXISTS result_media BYTEA")
-        await con.execute("ALTER TABLE gz_query_requests ADD COLUMN IF NOT EXISTS result_mime_type TEXT")
-        await con.execute("ALTER TABLE gz_query_requests ADD COLUMN IF NOT EXISTS result_file_name TEXT")
-        await con.execute("ALTER TABLE gz_query_requests ADD COLUMN IF NOT EXISTS result_caption TEXT")
-        await con.execute("""
-        CREATE TABLE IF NOT EXISTS gz_login_attempts (
-            id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-            owner_id BIGINT NOT NULL,
-            step TEXT NOT NULL,
-            phone TEXT,
-            phone_code_hash TEXT,
-            session_string TEXT NOT NULL,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-        """)
-        await con.execute("""
-        CREATE TABLE IF NOT EXISTS gz_bot_deliveries (
-            request_id TEXT PRIMARY KEY REFERENCES gz_query_requests(request_id) ON DELETE CASCADE,
-            chat_id BIGINT NOT NULL,
-            user_id BIGINT NOT NULL,
-            delivered BOOLEAN NOT NULL DEFAULT FALSE
-        )
+# Admin login is intentionally in-memory: an interrupted OTP flow must be
+# restarted rather than leaving an OTP/password challenge in the database.
+login_attempt: dict = {}
+
+
+def is_owner(message: Message) -> bool:
+    return bool(message.from_user and message.from_user.id == OWNER_ID)
+
+
+def encrypt_session(session_string: str) -> str:
+    return fernet.encrypt(session_string.encode()).decode()
+
+
+def decrypt_session(encrypted: str) -> str:
+    return fernet.decrypt(encrypted.encode()).decode()
+
+
+async def init_db():
+    global db
+    db = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    async with db.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS telegram_account_session (
+                id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+                phone_number TEXT NOT NULL,
+                encrypted_session TEXT NOT NULL,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS relay_pending (
+                group_message_id BIGINT PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                request_text TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS relay_pending_created_idx
+                ON relay_pending(created_at);
+            CREATE TABLE IF NOT EXISTS relay_cooldowns (
+                user_id BIGINT PRIMARY KEY,
+                accepted_at TIMESTAMPTZ NOT NULL
+            );
         """)
 
 
-async def load_session() -> str:
-    async with pool.acquire() as con:
-        row = await con.fetchrow("SELECT session_string FROM gz_telegram_session WHERE id=1")
-    return row["session_string"] if row else ""
-
-
-async def save_session(phone: str):
-    session_string = telethon_client.session.save()
-    async with pool.acquire() as con:
-        await con.execute("""
-            INSERT INTO gz_telegram_session(id, session_string, phone, updated_at)
-            VALUES(1, $1, $2, NOW())
-            ON CONFLICT(id) DO UPDATE SET session_string=EXCLUDED.session_string,
-              phone=EXCLUDED.phone, updated_at=NOW()
-        """, session_string, phone)
-
-
-async def connect_telethon(session_string: str = ""):
-    global telethon_client
-    if not TELETHON_API_ID or not TELETHON_API_HASH:
-        raise RuntimeError("TELETHON_API_ID and TELETHON_API_HASH must be configured")
-    telethon_client = TelegramClient(StringSession(session_string), int(TELETHON_API_ID), TELETHON_API_HASH)
-    await telethon_client.connect()
-    if session_string and not await telethon_client.is_user_authorized():
-        log.warning("Saved Telethon session is no longer authorized; owner must run /login")
-    telethon_client.add_event_handler(on_group_message, events.NewMessage(chats=int(GROUP_ID)))
-
-
-async def on_group_message(event):
-    """Capture Bot 1's reply to a request and associate it with its sender."""
+async def load_saved_telethon_session() -> str | None:
+    async with db.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT encrypted_session
+            FROM telegram_account_session
+            WHERE id = 1 AND is_active = TRUE
+        """)
+    if not row:
+        return None
     try:
-        reply_id = event.message.reply_to_msg_id
-        if not reply_id:
-            return
-        sender = await event.get_sender()
-        sender_id = getattr(sender, "id", None)
-        if BOT1_ID and str(sender_id) != BOT1_ID:
-            return
-        async with pool.acquire() as con:
-            row = await con.fetchrow(
-                "SELECT request_id FROM gz_query_requests WHERE (telegram_message_id=$1 OR bot_reply_message_id=$1) AND status IN ('pending','processing') LIMIT 1",
-                int(reply_id),
+        return decrypt_session(row["encrypted_session"])
+    except (InvalidToken, ValueError):
+        log.exception("Stored Telethon session could not be decrypted.")
+        raise RuntimeError(
+            "The saved session cannot be decrypted. The hardcoded session encryption key may have changed."
+        )
+
+
+async def save_telethon_session(phone: str, session_string: str):
+    encrypted = encrypt_session(session_string)
+    async with db.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO telegram_account_session
+                (id, phone_number, encrypted_session, is_active, updated_at)
+            VALUES (1, $1, $2, TRUE, NOW())
+            ON CONFLICT (id) DO UPDATE SET
+                phone_number = EXCLUDED.phone_number,
+                encrypted_session = EXCLUDED.encrypted_session,
+                is_active = TRUE,
+                updated_at = NOW()
+        """, phone, encrypted)
+
+
+async def clear_telethon_session():
+    async with db.acquire() as conn:
+        await conn.execute("DELETE FROM telegram_account_session WHERE id = 1")
+
+
+async def connect_user_client(session_string: str | None = None):
+    """Create exactly one Telethon client in this process and verify its auth."""
+    global user_client
+    async with telethon_lock:
+        if user_client is not None:
+            try:
+                if user_client.is_connected() and await user_client.is_user_authorized():
+                    return user_client
+            except Exception:
+                log.exception("Existing Telethon client failed health check.")
+            try:
+                await user_client.disconnect()
+            except Exception:
+                log.exception("Error disconnecting old Telethon client.")
+            user_client = None
+
+        client = TelegramClient(
+            StringSession(session_string or ""),
+            API_ID,
+            API_HASH,
+            connection_retries=5,
+            request_retries=3,
+            auto_reconnect=True,
+        )
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            return None
+
+        @client.on(events.NewMessage(chats=GROUP_ID))
+        async def on_group_message(event):
+            try:
+                # Only accept messages authored by the configured Bot 1.
+                if event.sender_id != BOT1_ID:
+                    return
+                # Correlation is intentionally strict: Bot 1 must reply to the
+                # exact group message sent by the user account.
+                replied_to = event.message.reply_to_msg_id
+                if not replied_to:
+                    log.warning(
+                        "Ignored Bot 1 message %s: it was not a reply to a request.",
+                        event.message.id,
+                    )
+                    return
+                async with db.acquire() as conn:
+                    row = await conn.fetchrow("""
+                        DELETE FROM relay_pending
+                        WHERE group_message_id = $1
+                        RETURNING user_id
+                    """, replied_to)
+                if not row:
+                    log.info("No pending request found for group message %s", replied_to)
+                    return
+                response_text = event.raw_text or ""
+                if not response_text:
+                    return
+                try:
+                    await bot.send_message(
+                        chat_id=row["user_id"],
+                        text=response_text,
+                        parse_mode=None,
+                        disable_web_page_preview=True,
+                    )
+                except Exception:
+                    log.exception("Could not deliver Bot 1 response to user %s", row["user_id"])
+                task = pending_timeout_tasks.pop(replied_to, None)
+                if task:
+                    task.cancel()
+            except Exception:
+                log.exception("Error processing a group response.")
+
+        user_client = client
+        log.info("Telethon account connected and authorized.")
+        return user_client
+
+
+async def timeout_request(group_message_id: int, user_id: int):
+    try:
+        await asyncio.sleep(REQUEST_TIMEOUT_SECONDS)
+        async with db.acquire() as conn:
+            row = await conn.fetchrow("""
+                DELETE FROM relay_pending
+                WHERE group_message_id = $1
+                RETURNING user_id
+            """, group_message_id)
+        if row:
+            await bot.send_message(
+                user_id,
+                "⏳ No response received yet. Please try again later.",
+                parse_mode=None,
             )
-            if not row:
-                return
-            message = event.message
-            text = (message.raw_text or "").strip()
-            media_bytes = None
-            mime_type = None
-            file_name = None
-            if message.media:
-                media_bytes = await event.download_media(bytes)
-                if message.photo:
-                    mime_type = "image/jpeg"
-                    file_name = "response.jpg"
-                elif message.document:
-                    mime_type = message.document.mime_type or "application/octet-stream"
-                    file_name = getattr(message.file, "name", None) or "response.bin"
-            if not text and not media_bytes:
-                return
-            await asyncio.sleep(RESPONSE_SETTLE_SECONDS)
-            await con.execute(
-                "UPDATE gz_query_requests SET status='completed', result=$2, result_media=$3, result_mime_type=$4, result_file_name=$5, result_caption=$6, bot_reply_message_id=$7, updated_at=NOW() WHERE request_id=$1",
-                row["request_id"], text[:50000], media_bytes, mime_type, file_name,
-                (message.message or "")[:1000], int(message.id),
-            )
-            log.info("Captured Bot 1 reply for request %s", row["request_id"])
+    except asyncio.CancelledError:
+        pass
     except Exception:
-        log.exception("Failed to process private-group reply")
+        log.exception("Request timeout handler failed.")
 
 
-async def store_login_attempt(user_id: int, state: dict):
-    """Persist the temporary auth key and code hash so a worker restart cannot split the flow."""
-    session_string = login_client.session.save() if login_client else state.get("session_string", "")
-    state["session_string"] = session_string
-    async with pool.acquire() as con:
-        await con.execute("""
-            INSERT INTO gz_login_attempts(id, owner_id, step, phone, phone_code_hash, session_string, updated_at)
-            VALUES(1, $1, $2, $3, $4, $5, NOW())
-            ON CONFLICT(id) DO UPDATE SET owner_id=EXCLUDED.owner_id, step=EXCLUDED.step,
-              phone=EXCLUDED.phone, phone_code_hash=EXCLUDED.phone_code_hash,
-              session_string=EXCLUDED.session_string, updated_at=NOW()
-        """, user_id, state["step"], state.get("phone"), state.get("phone_code_hash"), session_string)
+async def check_and_set_cooldown(user_id: int) -> int:
+    """Return remaining cooldown seconds; zero means accepted."""
+    now = datetime.now(timezone.utc)
+    async with cooldown_lock:
+        async with db.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow("""
+                    SELECT accepted_at FROM relay_cooldowns
+                    WHERE user_id = $1 FOR UPDATE
+                """, user_id)
+                if row:
+                    elapsed = (now - row["accepted_at"]).total_seconds()
+                    remaining = int(COOLDOWN_SECONDS - elapsed + 0.999)
+                    if remaining > 0:
+                        return remaining
+                await conn.execute("""
+                    INSERT INTO relay_cooldowns(user_id, accepted_at)
+                    VALUES($1, $2)
+                    ON CONFLICT(user_id) DO UPDATE
+                    SET accepted_at = EXCLUDED.accepted_at
+                """, user_id, now)
+    return 0
 
 
-async def read_login_attempt(user_id: int):
-    async with pool.acquire() as con:
-        row = await con.fetchrow("SELECT owner_id, step, phone, phone_code_hash, session_string FROM gz_login_attempts WHERE id=1 AND owner_id=$1", user_id)
-    return dict(row) if row else None
+# --------------------------------- Admin ----------------------------------
 
-
-async def clear_login_attempt(user_id: int):
-    async with pool.acquire() as con:
-        await con.execute("DELETE FROM gz_login_attempts WHERE id=1 AND owner_id=$1", user_id)
-    login_state.pop(user_id, None)
-
-
-async def restore_login_client(state: dict):
-    """Restore the exact temporary Telegram auth key; never request another code here."""
-    global login_client
-    if login_client and login_client.is_connected():
-        return login_client
-    if login_client:
-        try:
-            await login_client.disconnect()
-        except Exception:
-            log.exception("Could not close stale temporary login connection")
-    login_client = TelegramClient(
-        StringSession(state.get("session_string") or ""),
-        int(TELETHON_API_ID), TELETHON_API_HASH,
+@dp.message(Command("start"))
+async def start_command(message: Message):
+    await message.answer(
+        "Send me a text message and I'll pass it to the processing group."
     )
-    await login_client.connect()
-    if state.get("step") == "code" and not state.get("phone_code_hash"):
-        raise RuntimeError("Persisted login attempt has no phone code hash")
-    return login_client
 
 
-async def begin_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start a simple owner-only Telegram login using one in-memory Telethon client."""
-    global login_client
-    user = update.effective_user
-    msg = update.effective_message
-    if not user or not msg:
+@dp.message(Command("login"))
+async def login_command(message: Message, state: FSMContext):
+    if not is_owner(message):
+        await message.answer("⛔ Unauthorized access.")
         return
-    if not owner_ok(user.id):
-        return
-    if not TELETHON_API_ID or not TELETHON_API_HASH:
-        await msg.reply_text("Set TELETHON_API_ID and TELETHON_API_HASH in Render Environment first.")
-        return
-
-    async with login_lock:
-        # Match the previous working login flow: keep one Telethon client alive
-        # from send_code_request() through sign_in(). Do not recreate it from a
-        # saved StringSession or reuse a persisted phone_code_hash while waiting
-        # for the OTP.
-        if login_client and login_client.is_connected():
-            await msg.reply_text("A login is already in progress. Enter the Telegram code that was sent, or send /cancel.")
-            return
-
-        if login_client:
-            try:
-                await login_client.disconnect()
-            except Exception:
-                log.exception("Could not close stale login client")
-            login_client = None
-
-        login_client = TelegramClient(StringSession(), int(TELETHON_API_ID), TELETHON_API_HASH)
-        await login_client.connect()
-        login_state[user.id] = {"step": "phone"}
-        await msg.reply_text("Send your Telegram phone number with country code (example: +91XXXXXXXXXX). Send /cancel to stop.")
-
-
-async def process_login_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Complete the owner login using the same Telethon client that requested the code."""
-    global telethon_client, login_client
-    user = update.effective_user
-    msg = update.effective_message
-    if not user or not msg or not owner_ok(user.id):
-        return False
-
-    async with login_lock:
-        state = login_state.get(user.id)
-        if not state or not login_client:
-            return False
-        value = (msg.text or "").strip()
-
-        if value.lower() == "/cancel":
-            try:
-                await login_client.disconnect()
-            except Exception:
-                log.exception("Failed to close cancelled login client")
-            login_client = None
-            login_state.pop(user.id, None)
-            await msg.reply_text("Login cancelled.")
-            return True
-
-        if not value:
-            await msg.reply_text("Please send the requested value as text, or /cancel.")
-            return True
-
+    if user_client is not None:
         try:
-            if not login_client.is_connected():
-                await login_client.connect()
-
-            if state["step"] == "phone":
-                phone = "".join(value.split())
-                if not phone.startswith("+") or not phone[1:].isdigit():
-                    await msg.reply_text("Send the phone number in international format, for example +91XXXXXXXXXX.")
-                    return True
-
-                # Keep the exact same client alive until sign_in(). Telethon then
-                # retains the code request/hash internally, as in the old working
-                # auth_session.py flow.
-                await login_client.send_code_request(phone)
-                state.update({"step": "code", "phone": phone})
-                await msg.reply_text("Telegram sent a login code. Enter that code now. Do not send /login again while entering it.")
-                return True
-
-            if state["step"] == "code":
-                code = "".join(ch for ch in value if ch in "0123456789")
-                if not code:
-                    await msg.reply_text("Enter the numeric Telegram login code, or send /cancel.")
-                    return True
-
-                # Deliberately omit phone_code_hash. Telethon uses the hash held
-                # by this same client from send_code_request(), matching the old
-                # successful login implementation.
-                await login_client.sign_in(phone=state["phone"], code=code)
-
-            elif state["step"] == "password":
-                await login_client.sign_in(password=value)
-            else:
-                await msg.reply_text("Unknown login state. Send /cancel and start again.")
-                return True
-
-            if await login_client.is_user_authorized():
-                new_client = login_client
-                new_client.add_event_handler(on_group_message, events.NewMessage(chats=int(GROUP_ID)))
-                old_client = telethon_client
-                telethon_client = new_client
-                login_client = None
-                login_state.pop(user.id, None)
-                await save_session(state.get("phone") or "authorized-session")
-                if old_client and old_client is not new_client:
-                    await old_client.disconnect()
-                await msg.reply_text("Telegram account authorized and session saved in PostgreSQL. Relay is ready.")
-                log.info("Owner login completed; authorized session saved")
-                return True
-
-            await msg.reply_text("Authorization is not complete yet. Follow the next prompt or send /cancel.")
-            return True
-
-        except SessionPasswordNeededError:
-            state["step"] = "password"
-            await msg.reply_text("Two-step verification is enabled. Send your Telegram 2FA password here.")
-            return True
-        except PhoneCodeExpiredError:
-            log.warning("Telegram says the phone code expired")
-            try:
-                await login_client.disconnect()
-            except Exception:
-                log.exception("Could not close expired login client")
-            login_client = None
-            login_state.pop(user.id, None)
-            await msg.reply_text("Telegram has expired this login code. Send /login once to start a completely new login attempt.")
-            return True
-        except PhoneCodeInvalidError:
-            log.warning("Telegram rejected the submitted code as invalid")
-            await msg.reply_text("Telegram says this code is incorrect. Enter the code from the login message that was sent for this attempt.")
-            return True
-        except FloodWaitError as exc:
-            await msg.reply_text(f"Telegram is limiting login attempts. Wait {exc.seconds} seconds before requesting another code.")
-            return True
-        except Exception as exc:
-            log.exception("Telethon login step failed")
-            await msg.reply_text(f"Login step failed ({type(exc).__name__}). Send /cancel and start a new login attempt if needed.")
-            return True
-
-
-async def handle_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Forward all private-chat messages except /start, /help and owner-only /login."""
-    user = update.effective_user
-    chat = update.effective_chat
-    msg = update.effective_message
-    if not user or not chat or not msg or chat.type != ChatType.PRIVATE:
-        return
-    # These control commands are never relayed to the private group.
-    # /login is accepted only from the configured owner.
-    command = ""
-    if msg.text and msg.text.lstrip().startswith("/"):
-        command = msg.text.lstrip().split(maxsplit=1)[0].split("@", 1)[0].lower()
-    if command in {"/start", "/help"}:
-        return
-    if command == "/login":
-        if owner_ok(user.id):
-            await begin_login(update, context)
-        return
-    if command == "/cancel" and owner_ok(user.id) and user.id in login_state:
-        await process_login_message(update, context)
-        return
-    if await process_login_message(update, context):
-        return
-    if not telethon_client or not await telethon_client.is_user_authorized():
-        if owner_ok(user.id):
-            await msg.reply_text("Telegram account is not logged in yet. Send /login to connect it.")
-        log.warning("Incoming message not relayed because Telethon is not authorized")
-        return
-
-    request_id = str(uuid.uuid4())
-    body = msg.text or msg.caption or ""
-    header = f"📨 New message\nUser ID: {user.id}\nName: {user.full_name}\nRequest: {request_id}"
-    try:
-        if msg.text is not None:
-            sent = await telethon_client.send_message(int(GROUP_ID), header + "\n\n" + msg.text)
-        elif msg.effective_attachment:
-            attachment = msg.effective_attachment
-            if isinstance(attachment, (list, tuple)):
-                attachment = attachment[-1]
-            file_obj = io.BytesIO()
-            tg_file = await context.bot.get_file(attachment.file_id)
-            await tg_file.download_to_memory(out=file_obj)
-            file_obj.seek(0)
-            sent = await telethon_client.send_file(
-                int(GROUP_ID), file_obj,
-                caption=(header + ("\n\n" + body if body else ""))[:1024],
-                file_name=getattr(attachment, "file_name", None) or "user_upload.bin",
-            )
-        else:
-            details = body
-            if msg.location:
-                details = f"Location: {msg.location.latitude}, {msg.location.longitude}"
-            elif msg.contact:
-                details = f"Contact: {msg.contact.first_name} {msg.contact.last_name or ''} | {msg.contact.phone_number}"
-            elif msg.venue:
-                details = f"Venue: {msg.venue.title} | {msg.venue.address} | {msg.venue.location.latitude}, {msg.venue.location.longitude}"
-            elif msg.poll:
-                details = f"Poll: {msg.poll.question}\n" + "\n".join(option.text for option in msg.poll.options)
-            elif msg.dice:
-                details = f"Dice: {msg.dice.emoji} {msg.dice.value}"
-            sent = await telethon_client.send_message(int(GROUP_ID), header + "\n\n" + (details or "[Message received]"))
-        group_message_id = sent.id if not isinstance(sent, list) else sent[0].id
-        async with pool.acquire() as con:
-            await con.execute(
-                "INSERT INTO gz_query_requests(request_id, command, query_text, telegram_message_id, status) VALUES($1,$2,$3,$4,'pending')",
-                request_id, "message", body[:50000], group_message_id,
-            )
-            await con.execute(
-                "INSERT INTO gz_bot_deliveries(request_id, chat_id, user_id) VALUES($1,$2,$3)",
-                request_id, chat.id, user.id,
-            )
-    except Exception:
-        log.exception("Failed to forward incoming user message")
-
-
-async def delivery_worker(app: Application):
-    while True:
-        try:
-            async with pool.acquire() as con:
-                rows = await con.fetch("""
-                    SELECT d.request_id, d.chat_id, q.result, q.status,
-                           q.result_media, q.result_mime_type, q.result_file_name, q.result_caption
-                    FROM gz_bot_deliveries d JOIN gz_query_requests q USING(request_id)
-                    WHERE d.delivered=FALSE AND q.status='completed'
-                    ORDER BY q.created_at LIMIT 25
-                """)
-                for row in rows:
-                    try:
-                        caption = (row["result_caption"] or row["result"] or "Bot 1 response")[:1000]
-                        media = row["result_media"]
-                        if media:
-                            file_obj = io.BytesIO(bytes(media))
-                            file_obj.name = row["result_file_name"] or "response.bin"
-                            mime = (row["result_mime_type"] or "").lower()
-                            if mime.startswith("image/"):
-                                await app.bot.send_photo(chat_id=row["chat_id"], photo=file_obj, caption=caption)
-                            elif mime.startswith("video/"):
-                                await app.bot.send_video(chat_id=row["chat_id"], video=file_obj, caption=caption)
-                            elif mime.startswith("audio/"):
-                                await app.bot.send_audio(chat_id=row["chat_id"], audio=file_obj, caption=caption)
-                            else:
-                                await app.bot.send_document(chat_id=row["chat_id"], document=file_obj, caption=caption)
-                        elif row["result"]:
-                            await app.bot.send_message(chat_id=row["chat_id"], text=row["result"][:4000], disable_web_page_preview=True)
-                        else:
-                            continue
-                        await con.execute("UPDATE gz_bot_deliveries SET delivered=TRUE WHERE request_id=$1", row["request_id"])
-                    except Exception:
-                        log.exception("Could not deliver result for %s", row["request_id"])
-        except asyncio.CancelledError:
-            raise
+            if user_client.is_connected() and await user_client.is_user_authorized():
+                await message.answer("✅ Telegram account is already logged in. Use /status.")
+                return
         except Exception:
-            log.exception("Delivery worker failed")
-        await asyncio.sleep(1)
+            pass
+    await state.clear()
+    login_attempt.clear()
+    await state.set_state(LoginFlow.phone)
+    await message.answer("Send the phone number with country code, e.g. +91XXXXXXXXXX")
 
 
-async def post_init(app: Application):
-    app.create_task(delivery_worker(app))
+@dp.message(LoginFlow.phone)
+async def login_phone(message: Message, state: FSMContext):
+    if not is_owner(message):
+        await state.clear()
+        return
+    if (message.text or "").strip() == "/cancel":
+        client = login_attempt.get("client")
+        if client:
+            await client.disconnect()
+        login_attempt.clear()
+        await state.clear()
+        await message.answer("Login flow cancelled.")
+        return
+    phone = (message.text or "").strip()
+    if not phone.startswith("+") or not phone[1:].isdigit():
+        await message.answer("Invalid phone number. Send it in international format, e.g. +91XXXXXXXXXX")
+        return
+    async with telethon_lock:
+        global user_client
+        if user_client is not None:
+            try:
+                await user_client.disconnect()
+            except Exception:
+                pass
+            user_client = None
+        client = TelegramClient(StringSession(), API_ID, API_HASH)
+        await client.connect()
+        try:
+            sent = await client.send_code_request(phone)
+        except PhoneNumberInvalidError:
+            await client.disconnect()
+            await message.answer("❌ Telegram rejected that phone number. Try /login again.")
+            await state.clear()
+            return
+        except Exception:
+            await client.disconnect()
+            log.exception("Could not request Telegram login code.")
+            await message.answer("❌ Could not request a login code. Check logs and try /login again.")
+            await state.clear()
+            return
+        login_attempt["client"] = client
+        login_attempt["phone"] = phone
+        login_attempt["phone_code_hash"] = sent.phone_code_hash
+    await state.set_state(LoginFlow.code)
+    await message.answer("Telegram sent a login code. Send the code here.")
+
+
+@dp.message(LoginFlow.code)
+async def login_code(message: Message, state: FSMContext):
+    if not is_owner(message):
+        await state.clear()
+        return
+    if (message.text or "").strip() == "/cancel":
+        client = login_attempt.get("client")
+        if client:
+            await client.disconnect()
+        login_attempt.clear()
+        await state.clear()
+        await message.answer("Login flow cancelled.")
+        return
+    code = (message.text or "").replace(" ", "").strip()
+    client = login_attempt.get("client")
+    if client is None:
+        await state.clear()
+        await message.answer("Login attempt expired. Start again with /login.")
+        return
+    try:
+        await client.sign_in(
+            phone=login_attempt["phone"],
+            code=code,
+            phone_code_hash=login_attempt["phone_code_hash"],
+        )
+    except SessionPasswordNeededError:
+        await state.set_state(LoginFlow.password)
+        await message.answer("Two-step verification is enabled. Send your Telegram 2FA password.")
+        return
+    except (PhoneCodeInvalidError, PhoneCodeExpiredError):
+        await message.answer("❌ Invalid or expired code. Send the latest code, or /cancel and restart.")
+        return
+    except Exception:
+        log.exception("Telegram sign-in failed.")
+        await message.answer("❌ Login failed. Use /cancel and try /login again.")
+        return
+    await finish_login(message, state, client)
+
+
+@dp.message(LoginFlow.password)
+async def login_password(message: Message, state: FSMContext):
+    if not is_owner(message):
+        await state.clear()
+        return
+    if (message.text or "").strip() == "/cancel":
+        client = login_attempt.get("client")
+        if client:
+            await client.disconnect()
+        login_attempt.clear()
+        await state.clear()
+        await message.answer("Login flow cancelled.")
+        return
+    client = login_attempt.get("client")
+    if client is None:
+        await state.clear()
+        await message.answer("Login attempt expired. Start again with /login.")
+        return
+    try:
+        await client.sign_in(password=message.text or "")
+    except Exception:
+        log.exception("Telegram 2FA sign-in failed.")
+        await message.answer("❌ Incorrect password or login error. Try again, or /cancel.")
+        return
+    await finish_login(message, state, client)
+
+
+async def finish_login(message: Message, state: FSMContext, client: TelegramClient):
+    global user_client
+    try:
+        if not await client.is_user_authorized():
+            raise RuntimeError("Telegram did not authorize the account.")
+        me = await client.get_me()
+        session_string = client.session.save()
+        await save_telethon_session(login_attempt["phone"], session_string)
+        # Attach the group listener and promote this authenticated client.
+        await client.disconnect()
+        login_attempt.clear()
+        await state.clear()
+        connected = await connect_user_client(session_string)
+        if connected is None:
+            raise RuntimeError("Could not restore the newly saved session.")
+        await message.answer(
+            f"✅ Telegram account connected successfully.\n"
+            f"Account: {me.phone or 'Hidden'}\n"
+            f"Session securely saved in PostgreSQL."
+        )
+    except Exception:
+        log.exception("Could not finish Telegram login.")
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        login_attempt.clear()
+        await state.clear()
+        await message.answer("❌ Login could not be completed. Check Railway logs and try /login again.")
+
+
+@dp.message(Command("cancel"))
+async def cancel_command(message: Message, state: FSMContext):
+    if not is_owner(message):
+        await message.answer("⛔ Unauthorized access.")
+        return
+    client = login_attempt.get("client")
+    if client:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+    login_attempt.clear()
+    await state.clear()
+    await message.answer("Login flow cancelled.")
+
+
+@dp.message(Command("status"))
+async def status_command(message: Message):
+    if not is_owner(message):
+        await message.answer("⛔ Unauthorized access.")
+        return
+    try:
+        if user_client and user_client.is_connected() and await user_client.is_user_authorized():
+            me = await user_client.get_me()
+            await message.answer(f"✅ Connected as {me.phone or 'Telegram account'}.")
+            return
+        saved = await load_saved_telethon_session()
+        if saved:
+            await message.answer("⚠️ A session is saved, but the Telegram client is not connected.")
+        else:
+            await message.answer("❌ No Telegram account is logged in. Use /login.")
+    except Exception:
+        log.exception("Status check failed.")
+        await message.answer("❌ Could not check Telegram account status.")
+
+
+@dp.message(Command("logout"))
+async def logout_command(message: Message):
+    global user_client
+    if not is_owner(message):
+        await message.answer("⛔ Unauthorized access.")
+        return
+    async with telethon_lock:
+        if user_client:
+            try:
+                await user_client.disconnect()
+            except Exception:
+                log.exception("Telethon disconnect failed.")
+            user_client = None
+        await clear_telethon_session()
+    await message.answer("✅ Telethon session removed from the database. Use /login to connect again.")
+
+
+# ----------------------------- Public requests ----------------------------
+
+@dp.message(F.text)
+async def handle_user_text(message: Message):
+    if not message.from_user:
+        return
+    # Admin commands and other slash commands are not forwarded as requests.
+    if (message.text or "").startswith("/"):
+        return
+    remaining = await check_and_set_cooldown(message.from_user.id)
+    if remaining:
+        await message.answer(f"⏳ Please wait {remaining} seconds before sending another message.")
+        return
+
+    client = user_client
+    if client is None or not client.is_connected():
+        await message.answer("⚠️ The service is temporarily unavailable. Please try again later.")
+        return
+    try:
+        sent = await client.send_message(GROUP_ID, message.text)
+        async with db.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO relay_pending(group_message_id, user_id, request_text)
+                VALUES($1, $2, $3)
+                ON CONFLICT(group_message_id) DO UPDATE
+                SET user_id = EXCLUDED.user_id,
+                    request_text = EXCLUDED.request_text,
+                    created_at = NOW()
+            """, sent.id, message.from_user.id, message.text)
+        task = asyncio.create_task(timeout_request(sent.id, message.from_user.id))
+        pending_timeout_tasks[sent.id] = task
+        await message.answer("✅ Your text request has been sent.")
+    except Exception:
+        log.exception("Could not forward request to the private group.")
+        await message.answer("❌ Could not send your request right now. Please try again later.")
+
+
+@dp.message()
+async def reject_non_text(message: Message):
+    if message.from_user and message.text is None:
+        await message.answer("Please send a text message only. Photos, videos, files, audio and stickers aren't supported.")
+
+
+async def restore_telethon():
+    try:
+        saved = await load_saved_telethon_session()
+        if not saved:
+            log.info("No saved Telegram user session. Owner can use /login.")
+            return
+        client = await connect_user_client(saved)
+        if client is None:
+            log.warning("Saved Telethon session is no longer authorized. Owner should use /login.")
+        else:
+            log.info("Saved Telethon session restored.")
+    except Exception:
+        log.exception("Could not restore saved Telethon session.")
 
 
 async def main():
-    global bot_app, instance_lock_conn
-    required = ["BOT_TOKEN", "GROUP_ID", "TELETHON_API_ID", "TELETHON_API_HASH", "DATABASE_URL"]
-    missing = [name for name in required if not os.getenv(name)]
-    if missing:
-        raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
-    await db_init()
-    # Only one process may poll Bot 2 and own the in-flight Telethon authorization.
-    instance_lock_conn = await pool.acquire()
-    lock_acquired = await instance_lock_conn.fetchval("SELECT pg_try_advisory_lock(741209811)")
-    if not lock_acquired:
-        await pool.release(instance_lock_conn)
-        instance_lock_conn = None
-        raise RuntimeError("Another GAMERZONE worker is already active for this database. Set the Render instance count to 1.")
-    # Prefer the PostgreSQL session; use TELETHON_SESSION for the first deployment
-    # or recovery when the database has no authorized session yet.
-    saved = await load_session()
-    if not saved:
-        saved = TELETHON_SESSION
-    await connect_telethon(saved)
-    if await telethon_client.is_user_authorized():
-        log.info("Telethon session loaded and authorized")
-        if not await load_session():
-            await save_session(TELETHON_PHONE or "configured-session")
-            log.info("Initial Telethon session saved to PostgreSQL")
-    else:
-        log.warning("Telethon is not authorized yet. Bot 2 will start; the owner can send /login to authenticate.")
-    bot_app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-    bot_app.add_handler(MessageHandler(filters.ALL, handle_incoming))
-    log.info("GAMERZONE Python bot starting")
-    await bot_app.initialize()
-    await bot_app.start()
-    await bot_app.updater.start_polling(drop_pending_updates=True)
+    await init_db()
+    await restore_telethon()
     try:
-        await asyncio.Event().wait()
+        await dp.start_polling(bot)
     finally:
-        await bot_app.updater.stop()
-        await bot_app.stop()
-        await bot_app.shutdown()
-        if telethon_client:
-            await telethon_client.disconnect()
-        if instance_lock_conn:
-            try:
-                await instance_lock_conn.execute("SELECT pg_advisory_unlock(741209811)")
-            finally:
-                await pool.release(instance_lock_conn)
-                instance_lock_conn = None
-        if pool:
-            await pool.close()
+        global user_client
+        if user_client:
+            await user_client.disconnect()
+        await bot.session.close()
+        if db:
+            await db.close()
 
 
 if __name__ == "__main__":

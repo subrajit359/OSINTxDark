@@ -1,45 +1,68 @@
-# GAMERZONE Telegram Relay
+# Telegram Relay Bot (single-folder project)
 
-Bot 2 is an automatic message relay. It has no public command menu or command restrictions.
+This is the first implementation of the agreed text-only relay workflow.
 
-## Message flow
+## What it does
 
-1. Any message sent to Bot 2 in a private chat is forwarded to the configured private group.
-2. The forwarded group message includes the sender's Telegram user ID and a unique request ID.
-3. When Bot 1 replies directly to that forwarded message, the relay captures the reply.
-4. Bot 2 sends the captured text or supported media to the original user.
+- Bot 2 accepts text messages only.
+- A logged-in Telegram user account (Telethon) sends each request to the configured private group.
+- Only messages from `BOT1_ID` are considered Bot 1 responses.
+- Bot 1's response is delivered as its original text to the originating user.
+- Each user has a 30-second cooldown.
+- `/login`, `/logout`, and `/status` are restricted to `OWNER_ID`.
+- Telethon session data is encrypted and stored in PostgreSQL, not in an environment variable.
+- A saved session is restored when the Railway service restarts.
 
-Text, photos, videos, audio, documents, voice messages, stickers and other Telegram attachments supported by the Bot API are forwarded. Location, contact, venue, poll and dice messages are converted to readable text for the group.
+## Critical response-matching requirement
 
-## Environment variables
+For safe concurrent users, **Bot 1 must reply directly to the exact group message sent by the Telethon account** (Telegram's reply-to feature). The code matches Bot 1's response using `reply_to_msg_id`.
 
-Keep these existing variable names in Railway:
+If Bot 1 sends a standalone message that is not a reply, the bot deliberately ignores it. Without a reply reference or another unique request identifier, it is not possible to reliably know which user should receive a standalone response when multiple requests are active.
 
-- `BOT_TOKEN` — Bot 2 token
-- `GROUP_ID` — private group ID
-- `BOT1_ID` — Bot 1 numeric Telegram user ID; used to accept replies only from Bot 1
-- `TELETHON_API_ID`
-- `TELETHON_API_HASH`
-- `TELETHON_PHONE` — phone number used only by the local session generator
-- `TELETHON_SESSION` — initial Telethon StringSession; after first successful boot it is saved to PostgreSQL
-- `DATABASE_URL` — PostgreSQL connection URL
-- `RESPONSE_SETTLE_SECONDS` — optional, default `1.0`
-- `RESPONSE_TIMEOUT_SECONDS` — retained for compatibility; no timeout message is sent
+## Files
 
-The Telethon user session lets the relay observe Bot 1's group replies. The owner can authorize directly in Bot 2 with `/login`, then send the phone number, Telegram login code, and (if enabled) 2FA password. The temporary authorization key and phone-code hash are stored in PostgreSQL during the login flow, so a process restart does not silently replace the code request. Repeating `/login` while an attempt is pending does not request another code. `/cancel` clears the pending attempt. On success, the authorized session is saved in `gz_telegram_session`. Keep session credentials secret.
+Everything is in this one project folder:
+- `main.py` — application
+- `requirements.txt` — Python dependencies
+- `.env.example` — required environment variables
+- `Procfile` — Railway start command
 
-Run exactly one Render instance for this service. The PostgreSQL advisory lock prevents two workers sharing the same database from concurrently polling Bot 2 or handling the same login attempt.
+## Railway setup
 
-## Railway deployment
+1. Create a Railway project and add a PostgreSQL database.
+2. Deploy this folder from a GitHub repository.
+3. Set the variables shown in `.env.example` in the Railway service. The session encryption key is hardcoded in `main.py`, so it is not a Railway variable.
+4. Keep the hardcoded encryption key unchanged across deploys/restarts. It encrypts the database session.
+5. Set the Railway service start command to `python main.py` (or use the included Procfile).
+7. Set the service to **one replica**. Do not run multiple copies of the same Telethon account/session concurrently.
 
-- Root Directory: `/`
-- Build command: `pip install -r requirements.txt`
-- Start command: `python main.py`
-- Attach PostgreSQL and set `DATABASE_URL`.
+## First login
 
-## Telegram setup
+1. Start the service.
+2. Open Bot 2 as the owner.
+3. Send `/login`.
+4. Enter the phone number in international format.
+5. Enter the Telegram login code.
+6. If requested, enter the Telegram 2-step verification password.
+7. Use `/status` to verify the connection.
 
-- Add Bot 1 to the private group and ensure it can process the forwarded messages.
-- Add the Telethon account to the same group with permission to send and read messages.
-- Configure `BOT1_ID` with Bot 1's numeric Telegram ID.
-- Bot 1 must reply directly to the forwarded request message so the relay can associate the result with the correct user.
+Admin commands:
+- `/login`
+- `/logout`
+- `/status`
+- `/cancel` (cancels an in-progress login)
+
+## Notes and limitations in this initial version
+
+- Text only. Photos, videos, documents, voice/audio, stickers and other non-text messages are rejected.
+- Default Bot 1 response timeout is 120 seconds. Change `REQUEST_TIMEOUT_SECONDS` if needed.
+- The 30-second cooldown is per Telegram user.
+- A response must be a text reply to the exact forwarded group message.
+- Bot 1's ID must be the numeric sender ID, not the username.
+- Telegram login codes and 2FA passwords are entered into the private Bot 2 admin chat. Do not share them. Use a dedicated Telegram account for the relay if possible.
+- The Fernet session encryption key is hardcoded in `main.py`. Keep it private and unchanged; changing it makes the existing encrypted session in PostgreSQL unreadable.
+- Keep `DATABASE_URL` and all credentials private.
+
+## Before production
+
+This is a starter implementation and should be tested in a private test group first. Configure Telegram IDs correctly, confirm Bot 1 replies to the triggering message, and inspect Railway logs. Add a persistent queue/worker if you later need multiple replicas or high traffic.

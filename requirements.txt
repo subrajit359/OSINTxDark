@@ -1,4 +1,4 @@
-python-telegram-bot==21.10
-Telethon==1.38.1
-asyncpg==0.30.0
-python-dotenv==1.0.1
+aiogram>=3.7,<4
+Telethon>=1.36,<2
+asyncpg>=0.29,<1
+cryptography>=42,<46
