@@ -92,8 +92,16 @@ async def init_db():
                 request_text TEXT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
+            ALTER TABLE relay_pending
+                ADD COLUMN IF NOT EXISTS response_received BOOLEAN NOT NULL DEFAULT FALSE;
             CREATE INDEX IF NOT EXISTS relay_pending_created_idx
                 ON relay_pending(created_at);
+            CREATE TABLE IF NOT EXISTS relay_response_messages (
+                response_message_id BIGINT PRIMARY KEY,
+                group_message_id BIGINT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS relay_response_messages_request_idx
+                ON relay_response_messages(group_message_id);
             CREATE TABLE IF NOT EXISTS relay_cooldowns (
                 user_id BIGINT PRIMARY KEY,
                 accepted_at TIMESTAMPTZ NOT NULL
@@ -184,11 +192,21 @@ async def connect_user_client(session_string: str | None = None):
 
                 async with db.acquire() as conn:
                     if replied_to:
-                        # Preferred path: Bot 1 replies directly to the forwarded request.
+                        # Match a reply to the original request, or to any earlier
+                        # Bot 1 response belonging to that request (multi-part replies).
                         pending_row = await conn.fetchrow(
-                            "SELECT group_message_id, user_id FROM relay_pending WHERE group_message_id = $1",
+                            "SELECT p.group_message_id, p.user_id FROM relay_pending p "
+                            "WHERE p.group_message_id = $1",
                             replied_to,
                         )
+                        if pending_row is None:
+                            pending_row = await conn.fetchrow(
+                                "SELECT p.group_message_id, p.user_id "
+                                "FROM relay_response_messages r "
+                                "JOIN relay_pending p ON p.group_message_id = r.group_message_id "
+                                "WHERE r.response_message_id = $1",
+                                replied_to,
+                            )
 
                     if pending_row is None:
                         # Some processing bots post their result as a new group message.
@@ -252,13 +270,21 @@ async def connect_user_client(session_string: str | None = None):
                     return
 
                 async with db.acquire() as conn:
+                    # Keep the request open so every subsequent Bot 1 message
+                    # for this request is also delivered to the same user.
                     await conn.execute(
-                        "DELETE FROM relay_pending WHERE group_message_id = $1",
+                        "UPDATE relay_pending SET response_received = TRUE "
+                        "WHERE group_message_id = $1",
                         pending_row["group_message_id"],
                     )
-                task = pending_timeout_tasks.pop(pending_row["group_message_id"], None)
-                if task:
-                    task.cancel()
+                    # Remember this Bot 1 message ID too, so a later Bot 1
+                    # reply to this response is still routed to the same user.
+                    await conn.execute(
+                        "INSERT INTO relay_response_messages(response_message_id, group_message_id) "
+                        "VALUES($1, $2) ON CONFLICT(response_message_id) DO NOTHING",
+                        event.message.id,
+                        pending_row["group_message_id"],
+                    )
                 log.info(
                     "Delivered Bot 1 message %s to user %s for request %s",
                     event.message.id,
@@ -281,9 +307,13 @@ async def timeout_request(group_message_id: int, user_id: int):
             row = await conn.fetchrow("""
                 DELETE FROM relay_pending
                 WHERE group_message_id = $1
-                RETURNING user_id
+                RETURNING user_id, response_received
             """, group_message_id)
-        if row:
+            await conn.execute(
+                "DELETE FROM relay_response_messages WHERE group_message_id = $1",
+                group_message_id,
+            )
+        if row and not row["response_received"]:
             await bot.send_message(
                 user_id,
                 "⏳ No response received yet. Please try again later.",
