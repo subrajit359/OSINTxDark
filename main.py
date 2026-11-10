@@ -17,7 +17,11 @@ from telegram.constants import ChatType
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 load_dotenv()
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+_log_level_name = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+_log_level = getattr(logging, _log_level_name, logging.INFO)
+if not isinstance(_log_level, int):
+    _log_level = logging.INFO
+logging.basicConfig(level=_log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("gamerzone")
 
 # Keep the user's existing Railway variable names unchanged.
