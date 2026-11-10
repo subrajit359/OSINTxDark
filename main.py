@@ -173,15 +173,96 @@ async def on_group_message(event):
         log.exception("Failed to process private-group reply")
 
 
+async def begin_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start the owner-only Telethon login flow inside Bot 2 private chat."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+    if not owner_ok(user.id):
+        await msg.reply_text("This setup action is available only to the bot owner.")
+        return
+    if not TELETHON_API_ID or not TELETHON_API_HASH:
+        await msg.reply_text("Set TELETHON_API_ID and TELETHON_API_HASH in Render Environment first.")
+        return
+    login_state[user.id] = {"step": "phone"}
+    await msg.reply_text("Send your Telegram phone number with country code (example: +91XXXXXXXXXX). Send /cancel to stop.")
+
+
+async def process_login_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Consume owner login replies; return True when the message was handled."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg or not owner_ok(user.id) or user.id not in login_state:
+        return False
+    value = (msg.text or "").strip()
+    state = login_state[user.id]
+    if value.lower() == "/cancel":
+        login_state.pop(user.id, None)
+        await msg.reply_text("Login cancelled.")
+        return True
+    if not value:
+        await msg.reply_text("Please send the requested value as text, or /cancel.")
+        return True
+    try:
+        if state["step"] == "phone":
+            phone = value.replace(" ", "")
+            sent_code = await telethon_client.send_code_request(phone)
+            state.update({"step": "code", "phone": phone, "phone_code_hash": sent_code.phone_code_hash})
+            await msg.reply_text("Telegram login code requested. Send the code here.")
+            return True
+        if state["step"] == "code":
+            await telethon_client.sign_in(
+                phone=state["phone"], code=value,
+                phone_code_hash=state["phone_code_hash"],
+            )
+        elif state["step"] == "password":
+            await telethon_client.sign_in(password=value)
+        if await telethon_client.is_user_authorized():
+            await save_session(state["phone"])
+            login_state.pop(user.id, None)
+            await msg.reply_text("Telegram account authorized and session saved in PostgreSQL. Relay is ready.")
+            log.info("Telethon login completed by owner; session saved to PostgreSQL")
+            return True
+    except SessionPasswordNeededError:
+        state["step"] = "password"
+        await msg.reply_text("Two-step verification is enabled. Send your Telegram 2FA password here.")
+        return True
+    except Exception as exc:
+        log.warning("Telethon login step failed: %s", type(exc).__name__)
+        await msg.reply_text(f"Login step failed ({type(exc).__name__}). Check the value and try again, or send /cancel.")
+        return True
+    await msg.reply_text("Authorization is not complete yet. Follow the next prompt or send /cancel.")
+    return True
+
+
 async def handle_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Forward every private-chat message to the private group without command filtering."""
+    """Forward all private-chat messages except /start, /help and owner-only /login."""
     user = update.effective_user
     chat = update.effective_chat
     msg = update.effective_message
     if not user or not chat or not msg or chat.type != ChatType.PRIVATE:
         return
+    # These control commands are never relayed to the private group.
+    # /login is accepted only from the configured owner.
+    command = ""
+    if msg.text and msg.text.lstrip().startswith("/"):
+        command = msg.text.lstrip().split(maxsplit=1)[0].split("@", 1)[0].lower()
+    if command in {"/start", "/help"}:
+        return
+    if command == "/login":
+        if owner_ok(user.id):
+            await begin_login(update, context)
+        return
+    if command == "/cancel" and owner_ok(user.id) and user.id in login_state:
+        await process_login_message(update, context)
+        return
+    if await process_login_message(update, context):
+        return
     if not telethon_client or not await telethon_client.is_user_authorized():
-        log.error("Telethon session is not authorized; cannot relay incoming message")
+        if owner_ok(user.id):
+            await msg.reply_text("Telegram account is not logged in yet. Send /login to connect it.")
+        log.warning("Incoming message not relayed because Telethon is not authorized")
         return
 
     request_id = str(uuid.uuid4())
@@ -294,11 +375,7 @@ async def main():
             await save_session(TELETHON_PHONE or "configured-session")
             log.info("Initial Telethon session saved to PostgreSQL")
     else:
-        raise RuntimeError(
-            "Telethon session is missing or unauthorized. Generate a session with "
-            "auth_session.py, add its output as the Render environment variable "
-            "TELETHON_SESSION, then redeploy. Do not share this session string."
-        )
+        log.warning("Telethon is not authorized yet. Bot 2 will start; the owner can send /login to authenticate.")
     bot_app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     bot_app.add_handler(MessageHandler(filters.ALL, handle_incoming))
     log.info("GAMERZONE Python bot starting")
