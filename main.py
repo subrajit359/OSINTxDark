@@ -68,12 +68,18 @@ def is_owner(message: Message) -> bool:
 
 
 def clean_bot1_reply(text: str) -> str:
-    """Remove attribution to Dibakar and @username mentions from Bot 1's reply."""
-    text = re.sub(r"(?i)\brequested\s+by\s+Dibakar\b[:,]?", "", text)
-    text = re.sub(r"(?<![\w])@[A-Za-z0-9_]+", "", text)
-    # Keep the reply's line structure while removing empty lines and extra spaces.
-    lines = [re.sub(r"[ \t]{2,}", " ", line).strip() for line in text.splitlines()]
-    return "\n".join(line for line in lines if line).strip()
+    """Remove the whole 'Requested by:' attribution line and all @username mentions."""
+    cleaned_lines = []
+    for line in text.splitlines():
+        # Remove the complete attribution line, including stylized Unicode names
+        # such as 𝔇𝔦𝔟𝔞𝔨𝔞𝔯, rather than trying to match the displayed name.
+        if re.match(r"^\s*Requested\s+by\s*:", line, flags=re.IGNORECASE):
+            continue
+        line = re.sub(r"(?<![\w])@[A-Za-z0-9_]+", "", line)
+        line = re.sub(r"[ \t]{2,}", " ", line).strip()
+        if line:
+            cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
 
 
 def encrypt_session(session_string: str) -> str:
