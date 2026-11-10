@@ -68,3 +68,11 @@ Admin commands:
 ## Before production
 
 This is a starter implementation and should be tested in a private test group first. Configure Telegram IDs correctly, confirm Bot 1 replies to the triggering message, and inspect Railway logs. Add a persistent queue/worker if you later need multiple replicas or high traffic.
+
+### Standalone response-filter demonstration
+
+`demo_response_filter.py` demonstrates removal of `Requested by:` lines and
+`@username` mentions using fictional classroom sample text only. It is not
+connected to the live relay handler and does not alter messages delivered by
+the production bot. Run it with `python demo_response_filter.py` to see the
+synthetic example.

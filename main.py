@@ -74,6 +74,58 @@ def decrypt_session(encrypted: str) -> str:
     return fernet.decrypt(encrypted.encode()).decode()
 
 
+# Redact personal identifiers before relaying Bot 1 output to end users.
+_SENSITIVE_FIELDS = {
+    "name", "first_name", "middle_name", "last_name", "father_name",
+    "aadhar", "aadhaar", "mobile", "phone", "alternate_mobile",
+    "email", "address", "date_of_birth", "dob",
+}
+
+
+def _redact_json(value):
+    if isinstance(value, dict):
+        cleaned = {}
+        for key, item in value.items():
+            if str(key).casefold() in _SENSITIVE_FIELDS and item not in (None, ""):
+                cleaned[key] = "[REDACTED]"
+            else:
+                cleaned[key] = _redact_json(item)
+        return cleaned
+    if isinstance(value, list):
+        return [_redact_json(item) for item in value]
+    return value
+
+
+def prepare_user_response(text: str) -> str:
+    """Tidy Bot 1 output and redact sensitive personal-data fields.
+
+    Keeps source/credit lines and other attribution intact.
+    """
+    cleaned = "\n".join(line.rstrip() for line in (text or "").splitlines()).strip()
+    while "\n\n\n" in cleaned:
+        cleaned = cleaned.replace("\n\n\n", "\n\n")
+
+    # Redact a phone-like value in a Query header.
+    import re
+    cleaned = re.sub(
+        r"(?im)^(\s*Query\s*:\s*)[+()\d .-]{7,}$",
+        r"\1[REDACTED]",
+        cleaned,
+    )
+
+    # Pretty-print JSON objects embedded in Bot 1's message.
+    start = cleaned.find("{")
+    if start >= 0:
+        try:
+            parsed, end = json.JSONDecoder().raw_decode(cleaned[start:])
+            parsed = _redact_json(parsed)
+            pretty = json.dumps(parsed, ensure_ascii=False, indent=2)
+            cleaned = cleaned[:start] + pretty + cleaned[start + end:]
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+    return cleaned
+
+
 async def init_db():
     global db
     db = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
@@ -186,6 +238,9 @@ async def connect_user_client(session_string: str | None = None):
                 response_text = event.raw_text or ""
                 if not response_text.strip():
                     return
+                user_response_text = prepare_user_response(response_text)
+                if not user_response_text:
+                    return
 
                 replied_to = event.message.reply_to_msg_id
                 pending_row = None
@@ -260,7 +315,7 @@ async def connect_user_client(session_string: str | None = None):
                 try:
                     await bot.send_message(
                         chat_id=user_id,
-                        text=response_text,
+                        text=user_response_text,
                         parse_mode=None,
                         disable_web_page_preview=True,
                     )
