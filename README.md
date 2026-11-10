@@ -26,7 +26,9 @@ Keep these existing variable names in Railway:
 - `RESPONSE_SETTLE_SECONDS` — optional, default `1.0`
 - `RESPONSE_TIMEOUT_SECONDS` — retained for compatibility; no timeout message is sent
 
-The Telethon user session must be authorized so the relay can observe Bot 1's group replies. To create it without adding login commands to Bot 2, run `python auth_session.py` on your computer, enter the phone number, Telegram login code and (if enabled) 2FA password, then copy the printed session string into Render as `TELETHON_SESSION`. On first successful startup, the app stores it in PostgreSQL (`gz_telegram_session`). Keep the session string secret. The public bot has no `/login`, `/help`, `/start`, or lookup command handlers; every incoming private-chat message is treated as a user message and relayed.
+The Telethon user session lets the relay observe Bot 1's group replies. The owner can authorize directly in Bot 2 with `/login`, then send the phone number, Telegram login code, and (if enabled) 2FA password. The temporary authorization key and phone-code hash are stored in PostgreSQL during the login flow, so a process restart does not silently replace the code request. Repeating `/login` while an attempt is pending does not request another code. `/cancel` clears the pending attempt. On success, the authorized session is saved in `gz_telegram_session`. Keep session credentials secret.
+
+Run exactly one Render instance for this service. The PostgreSQL advisory lock prevents two workers sharing the same database from concurrently polling Bot 2 or handling the same login attempt.
 
 ## Railway deployment
 

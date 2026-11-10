@@ -42,25 +42,16 @@ RESPONSE_TIMEOUT_SECONDS = float(os.getenv("RESPONSE_TIMEOUT_SECONDS", "3600"))
 RESPONSE_SETTLE_SECONDS = float(os.getenv("RESPONSE_SETTLE_SECONDS", "1.0"))
 
 pool: Optional[asyncpg.Pool] = None
+instance_lock_conn = None
 telethon_client: Optional[TelegramClient] = None
 bot_app: Optional[Application] = None
 login_state: dict = {}
 login_client: Optional[TelegramClient] = None
+login_lock = asyncio.Lock()
 
 
 def owner_ok(user_id: int) -> bool:
     return bool(OWNER_ID) and str(user_id) == OWNER_ID
-
-
-async def send_text(update: Update, text: str, *, reply_markup=None):
-    msg = update.effective_message
-    if not msg:
-        return
-    text = str(text or "No result returned.")
-    max_body = 3900 - len(SUPPORT_FOOTER)
-    chunks = [text[i:i + max_body] for i in range(0, len(text), max_body)] or ["No result returned."]
-    for chunk in chunks:
-        await msg.reply_text(chunk + SUPPORT_FOOTER, disable_web_page_preview=True, reply_markup=reply_markup)
 
 
 async def db_init():
@@ -98,6 +89,17 @@ async def db_init():
         await con.execute("ALTER TABLE gz_query_requests ADD COLUMN IF NOT EXISTS result_mime_type TEXT")
         await con.execute("ALTER TABLE gz_query_requests ADD COLUMN IF NOT EXISTS result_file_name TEXT")
         await con.execute("ALTER TABLE gz_query_requests ADD COLUMN IF NOT EXISTS result_caption TEXT")
+        await con.execute("""
+        CREATE TABLE IF NOT EXISTS gz_login_attempts (
+            id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+            owner_id BIGINT NOT NULL,
+            step TEXT NOT NULL,
+            phone TEXT,
+            phone_code_hash TEXT,
+            session_string TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """)
         await con.execute("""
         CREATE TABLE IF NOT EXISTS gz_bot_deliveries (
             request_id TEXT PRIMARY KEY REFERENCES gz_query_requests(request_id) ON DELETE CASCADE,
@@ -179,138 +181,194 @@ async def on_group_message(event):
         log.exception("Failed to process private-group reply")
 
 
+async def store_login_attempt(user_id: int, state: dict):
+    """Persist the temporary auth key and code hash so a worker restart cannot split the flow."""
+    session_string = login_client.session.save() if login_client else state.get("session_string", "")
+    state["session_string"] = session_string
+    async with pool.acquire() as con:
+        await con.execute("""
+            INSERT INTO gz_login_attempts(id, owner_id, step, phone, phone_code_hash, session_string, updated_at)
+            VALUES(1, $1, $2, $3, $4, $5, NOW())
+            ON CONFLICT(id) DO UPDATE SET owner_id=EXCLUDED.owner_id, step=EXCLUDED.step,
+              phone=EXCLUDED.phone, phone_code_hash=EXCLUDED.phone_code_hash,
+              session_string=EXCLUDED.session_string, updated_at=NOW()
+        """, user_id, state["step"], state.get("phone"), state.get("phone_code_hash"), session_string)
+
+
+async def read_login_attempt(user_id: int):
+    async with pool.acquire() as con:
+        row = await con.fetchrow("SELECT owner_id, step, phone, phone_code_hash, session_string FROM gz_login_attempts WHERE id=1 AND owner_id=$1", user_id)
+    return dict(row) if row else None
+
+
+async def clear_login_attempt(user_id: int):
+    async with pool.acquire() as con:
+        await con.execute("DELETE FROM gz_login_attempts WHERE id=1 AND owner_id=$1", user_id)
+    login_state.pop(user_id, None)
+
+
+async def restore_login_client(state: dict):
+    """Restore the exact temporary Telegram auth key; never request another code here."""
+    global login_client
+    if login_client and login_client.is_connected():
+        return login_client
+    if login_client:
+        try:
+            await login_client.disconnect()
+        except Exception:
+            log.exception("Could not close stale temporary login connection")
+    login_client = TelegramClient(
+        StringSession(state.get("session_string") or ""),
+        int(TELETHON_API_ID), TELETHON_API_HASH,
+    )
+    await login_client.connect()
+    if state.get("step") == "code" and not state.get("phone_code_hash"):
+        raise RuntimeError("Persisted login attempt has no phone code hash")
+    return login_client
+
+
 async def begin_login(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start a clean owner-only Telethon authorization flow."""
+    """Start one owner-only login attempt. Repeated /login never invalidates a pending OTP."""
     global login_client
     user = update.effective_user
     msg = update.effective_message
     if not user or not msg:
         return
     if not owner_ok(user.id):
-        await msg.reply_text("This setup action is available only to the bot owner.")
         return
     if not TELETHON_API_ID or not TELETHON_API_HASH:
         await msg.reply_text("Set TELETHON_API_ID and TELETHON_API_HASH in Render Environment first.")
         return
 
-    # Use a brand-new, temporary authorization key. Reusing an old unauthorized
-    # StringSession can leave Telegram's phone-code hash tied to a stale auth flow.
-    login_state.pop(user.id, None)
-    if login_client:
-        try:
-            await login_client.disconnect()
-        except Exception:
-            log.exception("Could not close previous temporary login client")
-    login_client = TelegramClient(
-        StringSession(), int(TELETHON_API_ID), TELETHON_API_HASH
-    )
-    await login_client.connect()
-    login_state[user.id] = {"step": "phone"}
-    await msg.reply_text(
-        "Send your Telegram phone number with country code (example: +91XXXXXXXXXX). "
-        "Send /cancel to stop. Start only one login attempt at a time."
-    )
+    async with login_lock:
+        state = login_state.get(user.id) or await read_login_attempt(user.id)
+        if state:
+            login_state[user.id] = state
+            try:
+                await restore_login_client(state)
+            except Exception:
+                log.exception("Could not restore the pending login connection")
+                await msg.reply_text("The pending login connection could not be restored. Send /cancel, then /login once.")
+                return
+            if state["step"] == "code":
+                await msg.reply_text("A login code has already been requested. Enter the newest code from that request; /login will not request another code.")
+            elif state["step"] == "password":
+                await msg.reply_text("A login is waiting for your Telegram 2FA password. Send it now, or /cancel.")
+            else:
+                await msg.reply_text("Login is waiting for your phone number with country code (example: +91XXXXXXXXXX).")
+            return
+
+        login_client = TelegramClient(StringSession(), int(TELETHON_API_ID), TELETHON_API_HASH)
+        await login_client.connect()
+        state = {"step": "phone", "session_string": login_client.session.save()}
+        login_state[user.id] = state
+        await store_login_attempt(user.id, state)
+        await msg.reply_text("Send your Telegram phone number with country code (example: +91XXXXXXXXXX). Send /cancel to stop.")
 
 
 async def process_login_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Consume owner login replies; return True when the message was handled."""
+    """Consume owner login replies using one persistent auth key and one code hash."""
     global telethon_client, login_client
     user = update.effective_user
     msg = update.effective_message
-    if not user or not msg or not owner_ok(user.id) or user.id not in login_state:
+    if not user or not msg or not owner_ok(user.id):
         return False
-    value = (msg.text or "").strip()
-    state = login_state[user.id]
-    if value.lower() == "/cancel":
-        login_state.pop(user.id, None)
-        if login_client:
-            await login_client.disconnect()
-            login_client = None
-        await msg.reply_text("Login cancelled.")
-        return True
-    if not value:
-        await msg.reply_text("Please send the requested value as text, or /cancel.")
-        return True
-    try:
-        if not login_client or not login_client.is_connected():
-            await msg.reply_text("Login connection was lost. Send /login to start a new attempt.")
-            login_state.pop(user.id, None)
+
+    async with login_lock:
+        state = login_state.get(user.id) or await read_login_attempt(user.id)
+        if not state:
+            return False
+        login_state[user.id] = state
+        value = (msg.text or "").strip()
+
+        if value.lower() == "/cancel":
+            if login_client:
+                try:
+                    await login_client.disconnect()
+                except Exception:
+                    log.exception("Failed to close cancelled login client")
+                login_client = None
+            await clear_login_attempt(user.id)
+            await msg.reply_text("Login cancelled.")
             return True
 
-        if state["step"] == "phone":
-            phone = "".join(value.split())
-            sent_code = await login_client.send_code_request(phone)
-            state.update({
-                "step": "code",
-                "phone": phone,
-                "phone_code_hash": sent_code.phone_code_hash,
-            })
-            log.info("Telegram login code requested; delivery type=%s", type(sent_code).__name__)
-            await msg.reply_text(
-                "Telegram sent a login code. Enter that newest code exactly as received. "
-                "Do not request another code or restart /login while entering it."
-            )
+        if not value:
+            await msg.reply_text("Please send the requested value as text, or /cancel.")
             return True
 
-        if state["step"] == "code":
-            code = "".join(ch for ch in value if ch.isdigit())
-            if not code:
-                await msg.reply_text("Enter the numeric Telegram login code, or send /cancel.")
+        try:
+            await restore_login_client(state)
+
+            if state["step"] == "phone":
+                phone = "".join(value.split())
+                if not phone.startswith("+") or not phone[1:].isdigit():
+                    await msg.reply_text("Send the phone number in international format, for example +91XXXXXXXXXX.")
+                    return True
+                sent_code = await login_client.send_code_request(phone)
+                state.update({
+                    "step": "code",
+                    "phone": phone,
+                    "phone_code_hash": sent_code.phone_code_hash,
+                })
+                await store_login_attempt(user.id, state)
+                log.info("One Telegram login code requested; code hash stored with the same temporary session")
+                await msg.reply_text("Telegram sent a login code. Enter the newest code from this request. Do not send /login again while entering it.")
                 return True
-            await login_client.sign_in(
-                phone=state["phone"], code=code,
-                phone_code_hash=state["phone_code_hash"],
-            )
-        elif state["step"] == "password":
-            await login_client.sign_in(password=value)
 
-        if await login_client.is_user_authorized():
-            # Promote the successfully authorized temporary client to the relay client.
-            new_client = login_client
-            new_client.add_event_handler(on_group_message, events.NewMessage(chats=int(GROUP_ID)))
-            old_client = telethon_client
-            telethon_client = new_client
-            login_client = None
-            await save_session(state["phone"])
-            login_state.pop(user.id, None)
-            if old_client and old_client is not new_client:
-                await old_client.disconnect()
-            await msg.reply_text("Telegram account authorized and session saved in PostgreSQL. Relay is ready.")
-            log.info("Telethon login completed by owner; fresh session saved to PostgreSQL")
+            if state["step"] == "code":
+                code = "".join(ch for ch in value if ch in "0123456789")
+                if not code:
+                    await msg.reply_text("Enter the numeric Telegram login code, or send /cancel.")
+                    return True
+                await login_client.sign_in(phone=state["phone"], code=code, phone_code_hash=state["phone_code_hash"])
+            elif state["step"] == "password":
+                await login_client.sign_in(password=value)
+            else:
+                await msg.reply_text("Unknown login state. Send /cancel and start again.")
+                return True
+
+            if await login_client.is_user_authorized():
+                new_client = login_client
+                new_client.add_event_handler(on_group_message, events.NewMessage(chats=int(GROUP_ID)))
+                old_client = telethon_client
+                telethon_client = new_client
+                login_client = None
+                await save_session(state.get("phone") or "authorized-session")
+                await clear_login_attempt(user.id)
+                if old_client and old_client is not new_client:
+                    await old_client.disconnect()
+                await msg.reply_text("Telegram account authorized and session saved in PostgreSQL. Relay is ready.")
+                log.info("Owner login completed; authorized session saved")
+                return True
+
+            await store_login_attempt(user.id, state)
+            await msg.reply_text("Authorization is not complete yet. Follow the next prompt or send /cancel.")
             return True
 
-    except SessionPasswordNeededError:
-        state["step"] = "password"
-        await msg.reply_text("Two-step verification is enabled. Send your Telegram 2FA password here.")
-        return True
-    except PhoneCodeExpiredError:
-        log.warning("Telegram rejected the phone code as expired for this login attempt")
-        login_state.pop(user.id, None)
-        if login_client:
-            await login_client.disconnect()
-            login_client = None
-        await msg.reply_text(
-            "Telegram rejected this code as expired. The previous authorization attempt has been closed. "
-            "Send /login to create a completely fresh attempt, then enter the code from that attempt only."
-        )
-        return True
-    except PhoneCodeInvalidError:
-        await msg.reply_text("Telegram rejected that code. Check the newest code and enter it exactly, or send /cancel.")
-        return True
-    except FloodWaitError as exc:
-        await msg.reply_text(f"Telegram is limiting login attempts. Wait {exc.seconds} seconds before trying again.")
-        login_state.pop(user.id, None)
-        if login_client:
-            await login_client.disconnect()
-            login_client = None
-        return True
-    except Exception as exc:
-        log.exception("Telethon login step failed")
-        await msg.reply_text(f"Login step failed ({type(exc).__name__}). Send /cancel and start a fresh /login attempt.")
-        return True
-
-    await msg.reply_text("Authorization is not complete yet. Follow the next prompt or send /cancel.")
-    return True
+        except SessionPasswordNeededError:
+            state["step"] = "password"
+            await store_login_attempt(user.id, state)
+            await msg.reply_text("Two-step verification is enabled. Send your Telegram 2FA password here.")
+            return True
+        except PhoneCodeExpiredError:
+            log.warning("Telegram says the phone code/hash expired; clearing only this attempt")
+            if login_client:
+                await login_client.disconnect()
+                login_client = None
+            await clear_login_attempt(user.id)
+            await msg.reply_text("Telegram has expired this login code. Send /login once to request a new code.")
+            return True
+        except PhoneCodeInvalidError:
+            log.warning("Telegram rejected the submitted code as invalid; preserving the active attempt")
+            await msg.reply_text("Telegram says this code is incorrect. The current login attempt is still active; enter the code from its original message.")
+            return True
+        except FloodWaitError as exc:
+            await msg.reply_text(f"Telegram is limiting login attempts. Wait {exc.seconds} seconds before requesting another code.")
+            return True
+        except Exception as exc:
+            log.exception("Telethon login step failed")
+            await msg.reply_text(f"Login step failed ({type(exc).__name__}). The pending attempt was preserved; try again or send /cancel.")
+            return True
 
 
 async def handle_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -434,12 +492,19 @@ async def post_init(app: Application):
 
 
 async def main():
-    global bot_app
+    global bot_app, instance_lock_conn
     required = ["BOT_TOKEN", "GROUP_ID", "TELETHON_API_ID", "TELETHON_API_HASH", "DATABASE_URL"]
     missing = [name for name in required if not os.getenv(name)]
     if missing:
         raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
     await db_init()
+    # Only one process may poll Bot 2 and own the in-flight Telethon authorization.
+    instance_lock_conn = await pool.acquire()
+    lock_acquired = await instance_lock_conn.fetchval("SELECT pg_try_advisory_lock(741209811)")
+    if not lock_acquired:
+        await pool.release(instance_lock_conn)
+        instance_lock_conn = None
+        raise RuntimeError("Another GAMERZONE worker is already active for this database. Set the Render instance count to 1.")
     # Prefer the PostgreSQL session; use TELETHON_SESSION for the first deployment
     # or recovery when the database has no authorized session yet.
     saved = await load_session()
@@ -467,6 +532,12 @@ async def main():
         await bot_app.shutdown()
         if telethon_client:
             await telethon_client.disconnect()
+        if instance_lock_conn:
+            try:
+                await instance_lock_conn.execute("SELECT pg_advisory_unlock(741209811)")
+            finally:
+                await pool.release(instance_lock_conn)
+                instance_lock_conn = None
         if pool:
             await pool.close()
 
